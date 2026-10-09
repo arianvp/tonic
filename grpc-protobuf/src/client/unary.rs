@@ -25,31 +25,29 @@
 use std::marker::PhantomData;
 use std::pin::Pin;
 
-use grpc::Status;
-use grpc::StatusCode;
 use grpc::client::CallOptions;
 use grpc::client::InvokeOnce;
 use grpc::client::RecvStream as _;
+use grpc::client::RequestHeaders;
+use grpc::client::ResponseStreamItem;
 use grpc::client::SendOptions;
 use grpc::client::SendStream as _;
 use grpc::client::stream_util::RecvStreamValidator;
-use grpc::core::ClientResponseStreamItem;
-use grpc::core::RequestHeaders;
 use protobuf::AsMut;
 use protobuf::AsView;
-use protobuf::ClearAndParse;
 use protobuf::Message;
-use protobuf::MessageView;
-use protobuf::Proxied;
 
-use crate::CallBuilder;
 use crate::ProtoRecvMessage;
 use crate::ProtoSendMessage;
+use crate::Status;
+use crate::StatusError;
+use crate::client::CallBuilder;
 use crate::client::Internal;
+use crate::trailers_conv::status_from_trailers;
 
-/// Configures a unary call for gRPC Protobuf.  Implements `IntoFuture` which
-/// performs the call and resolves to the response as a `Result<Res, Status>`.
-/// Implements `CallBuilder` to provide common RPC configuration methods.
+/// Configures a unary call for gRPC Protobuf.  Implements [`IntoFuture`] which
+/// performs the call and resolves to the response as a [`Result<Res, Status>`].
+/// Implements [`CallBuilder`] to provide common RPC configuration methods.
 pub struct UnaryCallBuilder<'a, C, ReqMsgView, Res> {
     channel: C,
     method: String,
@@ -77,15 +75,8 @@ where
     /// and returning the status of the call.
     pub async fn with_response_message(self, res: &mut impl AsMut<MutProxied = Res>) -> Status
     where
-        // ReqMsgView is a proto message view. (Ideally we could just require
-        // "AsView" and protobuf would automatically include the rest.)
-        ReqMsgView: AsView + Send + Sync + 'a,
-        <ReqMsgView as AsView>::Proxied: Message,
-        for<'b> <<ReqMsgView as AsView>::Proxied as Proxied>::View<'b>: MessageView<'b>,
-        // Res is a proto message. (Ideally we could just require "Message" and
-        // protobuf would automatically include the rest.)
+        ReqMsgView: AsView<Proxied: Message> + Send + Sync + 'a,
         Res: Message,
-        for<'b> Res::Mut<'b>: ClearAndParse + Send + Sync,
     {
         let headers = RequestHeaders::new().with_method_name(self.method);
         let (mut tx, rx) = self.channel.invoke_once(headers, self.args).await;
@@ -94,9 +85,9 @@ where
         let _ = tx.send(req, SendOptions::new().with_final_msg(true)).await;
         let mut res = ProtoRecvMessage::from_mut(res);
         loop {
-            let i = rx.next(&mut res).await;
-            if let ClientResponseStreamItem::Trailers(t) = i {
-                return t.status().clone();
+            let i = rx.recv(&mut res).await;
+            if let ResponseStreamItem::Trailers(t) = i {
+                return status_from_trailers(t);
             }
         }
     }
@@ -105,30 +96,17 @@ where
 impl<'a, C, ReqMsgView, Res> IntoFuture for UnaryCallBuilder<'a, C, ReqMsgView, Res>
 where
     C: InvokeOnce + 'a,
-    // ReqMsgView is a proto message view. (Ideally we could just require
-    // "AsView" and protobuf would automatically include the rest.  For now we
-    // need the HRTBs.)
-    ReqMsgView: AsView + Send + Sync + 'a,
-    <ReqMsgView as AsView>::Proxied: Message,
-    for<'b> <<ReqMsgView as AsView>::Proxied as Proxied>::View<'b>: MessageView<'b>,
-    // Res is a proto message. (Ideally we could just require "Message" and
-    // protobuf would automatically include the rest.  For now we need the
-    // HRTBs.)
+    ReqMsgView: AsView<Proxied: Message> + Send + Sync + 'a,
     Res: Message,
-    for<'b> Res::Mut<'b>: ClearAndParse + Send + Sync,
 {
-    type Output = Result<Res, Status>;
+    type Output = Result<Res, StatusError>;
     type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
             let mut res = Res::default();
-            let status = self.with_response_message(&mut res).await;
-            if status.code() == StatusCode::Ok {
-                Ok(res)
-            } else {
-                Err(status)
-            }
+            self.with_response_message(&mut res).await?;
+            Ok(res)
         })
     }
 }

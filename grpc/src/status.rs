@@ -22,36 +22,43 @@
  *
  */
 
-mod server_status;
 mod status_code;
 
-pub use server_status::ServerStatus;
-pub use status_code::StatusCode;
+pub use status_code::StatusCodeError;
+
+/// Represents either a failing gRPC status or a successful result containing
+/// `T`.
+pub type Result<T> = std::result::Result<T, StatusError>;
 
 /// Represents a gRPC status.
 #[derive(Debug, Clone)]
-pub struct Status {
-    code: StatusCode,
+pub struct StatusError {
+    code: StatusCodeError,
     message: String,
 }
 
-impl Status {
-    /// Create a new `Status` with the given code and message.
-    pub fn new(code: StatusCode, message: impl Into<String>) -> Self {
-        Status {
+impl StatusError {
+    /// Create a new [`StatusError`] with the given code and message.
+    pub fn new(code: StatusCodeError, message: impl Into<String>) -> Self {
+        StatusError {
             code,
             message: message.into(),
         }
     }
 
-    /// Get the `StatusCode` of this `Status`.
-    pub fn code(&self) -> StatusCode {
+    /// Get the [`StatusCodeError`] of this [`StatusError`].
+    pub fn code(&self) -> StatusCodeError {
         self.code
     }
 
-    /// Get the message of this `Status`.
+    /// Get the message of this [`StatusError`].
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    /// Consumes the [`StatusError`] and returns its constituent parts (code and message).
+    pub fn into_parts(self) -> (StatusCodeError, String) {
+        (self.code, self.message)
     }
 
     /// Returns whether the status includes a code restricted for control
@@ -59,16 +66,28 @@ impl Status {
     pub(crate) fn is_restricted_control_plane_code(&self) -> bool {
         matches!(
             self.code,
-            StatusCode::InvalidArgument
-                | StatusCode::NotFound
-                | StatusCode::AlreadyExists
-                | StatusCode::FailedPrecondition
-                | StatusCode::Aborted
-                | StatusCode::OutOfRange
-                | StatusCode::DataLoss
+            StatusCodeError::InvalidArgument
+                | StatusCodeError::NotFound
+                | StatusCodeError::AlreadyExists
+                | StatusCodeError::FailedPrecondition
+                | StatusCodeError::Aborted
+                | StatusCodeError::OutOfRange
+                | StatusCodeError::DataLoss
         )
     }
 }
+
+impl std::fmt::Display for StatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.message.is_empty() {
+            write!(f, "{:?}", self.code)
+        } else {
+            write!(f, "{:?}: {}", self.code, self.message)
+        }
+    }
+}
+
+impl std::error::Error for StatusError {}
 
 #[cfg(test)]
 mod tests {
@@ -76,17 +95,26 @@ mod tests {
 
     #[test]
     fn test_status_new() {
-        let status = Status::new(StatusCode::Ok, "ok");
-        assert_eq!(status.code(), StatusCode::Ok);
-        assert_eq!(status.message(), "ok");
+        let status = StatusError::new(StatusCodeError::NotFound, "not ok");
+        assert_eq!(status.code(), StatusCodeError::NotFound);
+        assert_eq!(status.message(), "not ok");
     }
 
     #[test]
     fn test_status_debug() {
-        let status = Status::new(StatusCode::Ok, "ok");
+        let status = StatusError::new(StatusCodeError::Cancelled, "not ok");
         let debug = format!("{:?}", status);
         assert!(debug.contains("Status"));
-        assert!(debug.contains("Ok"));
-        assert!(debug.contains("ok"));
+        assert!(debug.contains("Cancelled"));
+        assert!(debug.contains("not ok"));
+    }
+
+    #[test]
+    fn test_status_display() {
+        let status = StatusError::new(StatusCodeError::NotFound, "not ok");
+        assert_eq!(format!("{status}"), "NotFound: not ok");
+
+        let status = StatusError::new(StatusCodeError::Cancelled, "");
+        assert_eq!(format!("{status}"), "Cancelled");
     }
 }

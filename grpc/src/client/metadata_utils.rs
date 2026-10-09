@@ -22,15 +22,17 @@
  *
  */
 
+//! Interceptors providing client-side access to metadata.
+
 use tokio::sync::oneshot;
-use tonic::metadata::MetadataMap;
 
 use crate::client::CallOptions;
 use crate::client::InvokeOnce;
 use crate::client::RecvStream;
+use crate::client::RequestHeaders;
 use crate::client::interceptor::Intercept;
 use crate::client::interceptor::InterceptOnce;
-use crate::core::RequestHeaders;
+use crate::metadata::MetadataMap;
 
 /// An interceptor that attaches metadata to outgoing RPC headers.
 pub struct AttachHeadersInterceptor {
@@ -38,6 +40,8 @@ pub struct AttachHeadersInterceptor {
 }
 
 impl AttachHeadersInterceptor {
+    /// Creates a new interceptor that will attach `md` to the client's outgoing
+    /// headers.
     pub fn new(md: MetadataMap) -> Self {
         Self { md }
     }
@@ -53,29 +57,34 @@ impl<I: InvokeOnce> Intercept<I> for AttachHeadersInterceptor {
         options: CallOptions,
         next: I,
     ) -> (Self::SendStream, Self::RecvStream) {
-        headers
-            .metadata_mut()
-            .as_mut()
-            .extend(self.md.as_ref().clone());
-
-        let md = headers.metadata_mut();
-        for entry in self.md.iter() {
-            match entry {
-                tonic::metadata::KeyAndValueRef::Ascii(k, v) => _ = md.insert(k, v.clone()),
-                tonic::metadata::KeyAndValueRef::Binary(k, v) => _ = md.insert_bin(k, v.clone()),
+        let incoming_meta = headers.metadata_mut();
+        incoming_meta.reserve(self.md.len());
+        for kv in self.md.iter() {
+            match kv {
+                crate::metadata::KeyAndValueRef::Ascii(key, value) => {
+                    incoming_meta.append(key, value.clone());
+                }
+                crate::metadata::KeyAndValueRef::Binary(key, value) => {
+                    incoming_meta.append_bin(key, value.clone());
+                }
             }
         }
         next.invoke_once(headers, options).await
     }
 }
 
-/// An interceptor that reads the received headers' metadata from the stream and
-/// sends them to the returned oneshot channel.
+/// An interceptor to read the metadata received in the server's headers.
 pub struct CaptureHeadersInterceptor {
     tx: oneshot::Sender<MetadataMap>,
 }
 
 impl CaptureHeadersInterceptor {
+    /// Creates an interceptor and a paired [`oneshot::Receiver`].  When the
+    /// interceptor is attached to a call, the server headers' metadata is sent
+    /// when it is available.  If the call completes without receiving headers
+    /// (e.g. it times out or is a trailers-only response), the matching
+    /// [`oneshot::Sender`] will be dropped and the `Receiver` will see an error
+    /// instead.
     pub fn new() -> (Self, oneshot::Receiver<MetadataMap>) {
         let (tx, rx) = oneshot::channel();
         (Self { tx }, rx)
@@ -97,21 +106,22 @@ impl<I: InvokeOnce> InterceptOnce<I> for CaptureHeadersInterceptor {
     }
 }
 
+/// The [`RecvStream`] portion of a [`CaptureHeadersInterceptor`].
 pub struct CaptureHeadersRecvStream<R> {
     rx: R,
     tx: Option<oneshot::Sender<MetadataMap>>,
 }
 
 impl<R> CaptureHeadersRecvStream<R> {
-    pub fn new(rx: R, tx: oneshot::Sender<MetadataMap>) -> Self {
+    fn new(rx: R, tx: oneshot::Sender<MetadataMap>) -> Self {
         Self { rx, tx: Some(tx) }
     }
 }
 
 impl<R: RecvStream> RecvStream for CaptureHeadersRecvStream<R> {
-    async fn next(&mut self, msg: &mut dyn super::RecvMessage) -> super::ClientResponseStreamItem {
-        let res = self.rx.next(msg).await;
-        if let super::ClientResponseStreamItem::Headers(headers) = &res
+    async fn recv(&mut self, msg: &mut dyn super::RecvMessage) -> super::ResponseStreamItem {
+        let res = self.rx.recv(msg).await;
+        if let super::ResponseStreamItem::Headers(headers) = &res
             && let Some(tx) = self.tx.take()
         {
             _ = tx.send(headers.metadata().clone());
@@ -120,13 +130,17 @@ impl<R: RecvStream> RecvStream for CaptureHeadersRecvStream<R> {
     }
 }
 
-/// An interceptor that reads the received trailers' metadata from the stream
-/// and sends them to the returned oneshot channel.
+/// An interceptor to read the metadata received in the server's trailers.
 pub struct CaptureTrailersInterceptor {
     tx: oneshot::Sender<MetadataMap>,
 }
 
 impl CaptureTrailersInterceptor {
+    /// Creates an interceptor and a paired [`oneshot::Receiver`].  When the
+    /// interceptor is attached to a call, the server trailers' metadata is sent
+    /// when it is available.  If the call is terminated before trailers are
+    /// received, the matching [`oneshot::Sender`] will be dropped, causing the
+    /// `Receiver` to error.
     pub fn new() -> (Self, oneshot::Receiver<MetadataMap>) {
         let (tx, rx) = oneshot::channel();
         (Self { tx }, rx)
@@ -148,21 +162,22 @@ impl<I: InvokeOnce> InterceptOnce<I> for CaptureTrailersInterceptor {
     }
 }
 
+/// The [`RecvStream`] portion of a [`CaptureTrailersInterceptor`].
 pub struct CaptureTrailersRecvStream<R> {
     rx: R,
     tx: Option<oneshot::Sender<MetadataMap>>,
 }
 
 impl<R> CaptureTrailersRecvStream<R> {
-    pub fn new(rx: R, tx: oneshot::Sender<MetadataMap>) -> Self {
+    fn new(rx: R, tx: oneshot::Sender<MetadataMap>) -> Self {
         Self { rx, tx: Some(tx) }
     }
 }
 
 impl<R: RecvStream> RecvStream for CaptureTrailersRecvStream<R> {
-    async fn next(&mut self, msg: &mut dyn super::RecvMessage) -> super::ClientResponseStreamItem {
-        let res = self.rx.next(msg).await;
-        if let super::ClientResponseStreamItem::Trailers(trailers) = &res
+    async fn recv(&mut self, msg: &mut dyn super::RecvMessage) -> super::ResponseStreamItem {
+        let res = self.rx.recv(msg).await;
+        if let super::ResponseStreamItem::Trailers(trailers) = &res
             && let Some(tx) = self.tx.take()
         {
             _ = tx.send(trailers.metadata().clone());
@@ -174,13 +189,12 @@ impl<R: RecvStream> RecvStream for CaptureTrailersRecvStream<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Status;
-    use crate::StatusCode;
+    use crate::client::ResponseHeaders;
+    use crate::client::ResponseStreamItem;
+    use crate::client::Trailers;
     use crate::client::test_util::MockInvoker;
     use crate::client::test_util::NopRecvMessage;
-    use crate::core::ClientResponseStreamItem;
-    use crate::core::ResponseHeaders;
-    use crate::core::Trailers;
+    use crate::metadata::BinaryMetadataValue;
 
     #[tokio::test]
     async fn test_attach_headers_interceptor() {
@@ -189,7 +203,7 @@ mod tests {
         md.insert("x-test-header", "test-value".parse().unwrap());
         md.insert_bin(
             "x-test-header-bin",
-            tonic::metadata::MetadataValue::from_bytes(b"test-bin"),
+            BinaryMetadataValue::from_bytes(b"test-bin"),
         );
         let interceptor = AttachHeadersInterceptor::new(md);
 
@@ -236,15 +250,15 @@ mod tests {
         // Send a Headers response on the call.
         let mut resp_md = MetadataMap::new();
         resp_md.insert("x-resp-header", "resp-value".parse().unwrap());
-        let mut headers = ResponseHeaders::default();
+        let mut headers = ResponseHeaders::new(crate::core::test_connection_info());
         *headers.metadata_mut() = resp_md;
         controller
-            .send_resp(ClientResponseStreamItem::Headers(headers))
+            .send_resp(ResponseStreamItem::Headers(headers))
             .await;
 
         // Receive the sent Headers response.
-        let res = recv_stream.next(&mut NopRecvMessage).await;
-        assert!(matches!(res, ClientResponseStreamItem::Headers(_)));
+        let res = recv_stream.recv(&mut NopRecvMessage).await;
+        assert!(matches!(res, ResponseStreamItem::Headers(_)));
 
         // Verify the received headers are correct.
         let captured_md = rx.await.unwrap();
@@ -265,15 +279,15 @@ mod tests {
         // Send a Trailers response on the call.
         let mut trailers_md = MetadataMap::new();
         trailers_md.insert("x-trailer", "trailer-value".parse().unwrap());
-        let mut trailers = Trailers::new(Status::new(StatusCode::Ok, "ok"));
+        let mut trailers = Trailers::new(Ok(()));
         *trailers.metadata_mut() = trailers_md;
         controller
-            .send_resp(ClientResponseStreamItem::Trailers(trailers))
+            .send_resp(ResponseStreamItem::Trailers(trailers))
             .await;
 
         // Receive the sent Trailers response.
-        let res = recv_stream.next(&mut NopRecvMessage).await;
-        assert!(matches!(res, ClientResponseStreamItem::Trailers(_)));
+        let res = recv_stream.recv(&mut NopRecvMessage).await;
+        assert!(matches!(res, ResponseStreamItem::Trailers(_)));
 
         // Verify the received trailers are correct.
         let captured_md = rx.await.unwrap();

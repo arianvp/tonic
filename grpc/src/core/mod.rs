@@ -22,19 +22,36 @@
  *
  */
 
-//! Types used to implement core gRPC functionality common to clients and
-//! servers.  Note that most gRPC applications should not need these types
-//! unless they are implementing custom interceptors.
+//! Core gRPC types common to clients and servers.
+//!
+//! This module provides the fundamental types used in gRPC communication, such
+//! as message traits.
+//!
+//! Most applications should not need to use these types directly, as they are
+//! typically used by generated code.  However, they may be necessary when
+//! implementing custom interceptors or advanced features.
+//!
+//! # Key Concepts
+//!
+//! - **[`SendMessage`] / [`RecvMessage`]:** Traits for encoding and decoding
+//!   messages.
 
 use std::any::TypeId;
+use std::fmt::Display;
+use std::fmt::Formatter;
+use std::fmt::Result as FmtResult;
+use std::hash::Hash;
 
 use bytes::Buf;
-use tonic::metadata::MetadataMap;
 
-use crate::Status;
+use crate::attributes::Attributes;
+use crate::byte_str::ByteStr;
+use crate::credentials::SecurityInfo;
 
+/// Represents a message sent by either a client or a server.
 #[allow(unused)]
 pub trait SendMessage: Send + Sync {
+    /// Encodes the message (`self`) as binary data.
     fn encode(&self) -> Result<Box<dyn Buf + Send + Sync>, String>;
 
     #[doc(hidden)]
@@ -43,8 +60,10 @@ pub trait SendMessage: Send + Sync {
     }
 }
 
+/// Represents a message received by either a client or a server.
 #[allow(unused)]
 pub trait RecvMessage: Send + Sync {
+    /// Encodes `data` into `self`.
     fn decode(&mut self, data: &mut dyn Buf) -> Result<(), String>;
 
     #[doc(hidden)]
@@ -53,9 +72,10 @@ pub trait RecvMessage: Send + Sync {
     }
 }
 
-/// A MessageType describes what underlying message is inside a SendMessage or
-/// RecvMessage so that it can be downcast, e.g. by interceptors.  It allows for
-/// safe downcasting to views containing a lifetime.
+/// Describes what underlying message is inside a [`SendMessage`] or
+/// [`RecvMessage`] so that it can be downcast, e.g. by interceptors.
+///
+/// Allows for safe downcasting to views containing a lifetime.
 pub trait MessageType {
     /// The message view's type, which may have a lifetime.
     type Target<'a>;
@@ -101,162 +121,89 @@ impl dyn RecvMessage + '_ {
     }
 }
 
-/// ResponseStreamItem represents an item in a response stream (either server
-/// sending or client receiving).
-///
-/// A response stream must always contain items exactly as follows:
-///
-/// [Headers *Message] Trailers *StreamClosed
-///
-/// That is: optionaly, a Headers value and any number of Message values
-/// (including zero), followed by a required Trailers value.  A response stream
-/// should not be used after Trailers, but reads should return StreamClosed if
-/// it is.
+/// An Address is an identifier that indicates how to connect to a server.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Address {
+    /// The network type is used to identify what kind of transport to create
+    /// when connecting to this address.  Typically TCP_IP_ADDRESS_TYPE.
+    pub network_type: &'static str,
+
+    /// The address itself is passed to the transport in order to create a
+    /// connection to it.
+    pub address: ByteStr,
+
+    /// Attributes contains arbitrary data about this address intended for
+    /// consumption by the subchannel.
+    pub attributes: Attributes,
+}
+
+impl Hash for Address {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.network_type.hash(state);
+        self.address.hash(state);
+    }
+}
+
+impl Display for Address {
+    #[allow(clippy::to_string_in_format_args)]
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        write!(f, "{}:{}", self.network_type, self.address.to_string())
+    }
+}
+
+/// Information about the connection to the RPC's peer (from the client/server
+/// pair).
 #[derive(Debug, Clone)]
-pub enum ResponseStreamItem<M> {
-    /// Indicates the headers for the stream.
-    Headers(ResponseHeaders),
-    /// Indicates a message on the stream.
-    Message(M),
-    /// Indicates trailers were received on the stream and includes the trailers.
-    Trailers(Trailers),
-    /// Indicates the response stream was closed.  Trailers must have been
-    /// provided before this value may be used.
-    StreamClosed,
+pub struct ConnectionInfo {
+    local_address: Address,
+    remote_address: Address,
+    security_info: SecurityInfo,
 }
 
-/// The client's view of a ResponseStream in a RecvStream: the message type is
-/// void as the received message is passed in via the `next` method.
-pub type ClientResponseStreamItem = ResponseStreamItem<()>;
-
-/// The server's view of a ResponseStream in a SendStream: the message type is
-/// part of the payload provided to the `send` method.
-pub type ServerResponseStreamItem<'a> = ResponseStreamItem<&'a dyn SendMessage>;
-
-/// Contains all information transmitted in the response headers of an RPC.
-#[derive(Debug, Clone, Default)]
-pub struct ResponseHeaders {
-    metadata: MetadataMap,
-}
-
-impl ResponseHeaders {
-    /// Returns a default ResponseHeaders instance.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Replaces the metadata of self with `metadata`.
-    pub fn with_metadata(mut self, metadata: MetadataMap) -> Self {
-        self.metadata = metadata;
-        self
-    }
-
-    /// Returns a reference to the metadata in these headers.
-    pub fn metadata(&self) -> &MetadataMap {
-        &self.metadata
-    }
-
-    /// Returns a mutable reference to the metadata in these headers.
-    pub fn metadata_mut(&mut self) -> &mut MetadataMap {
-        &mut self.metadata
-    }
-}
-
-/// Contains all information transmitted in the request headers of an RPC.
-#[derive(Debug, Clone, Default)]
-pub struct RequestHeaders {
-    /// The full (e.g. "/Service/Method") method name specified for the call.
-    method_name: String,
-    /// The application-specified metadata for the call.
-    metadata: MetadataMap,
-}
-
-impl RequestHeaders {
-    /// Returns a default RequestHeaders instance.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Replaces the method name of self with `method_name`.
-    pub fn with_method_name(mut self, method_name: impl Into<String>) -> Self {
-        self.method_name = method_name.into();
-        self
-    }
-
-    /// Replaces the metadata of self with `metadata`.
-    pub fn with_metadata(mut self, metadata: MetadataMap) -> Self {
-        self.metadata = metadata;
-        self
-    }
-
-    /// Returns the full (e.g. "/Service/Method") method name for these headers.
-    pub fn method_name(&self) -> &String {
-        &self.method_name
-    }
-
-    /// Returns a reference to the metadata in these headers.
-    pub fn metadata(&self) -> &MetadataMap {
-        &self.metadata
-    }
-
-    /// Returns a mutable reference to the metadata in these headers.
-    pub fn metadata_mut(&mut self) -> &mut MetadataMap {
-        &mut self.metadata
-    }
-
-    /// Returns the owned fields in the RequestHeaders.
-    // TODO: make public once fields are fixed.
-    pub(crate) fn into_parts(self) -> (String, MetadataMap) {
-        (self.method_name, self.metadata)
-    }
-}
-
-/// Contains all information transmitted in the response trailers of an RPC.
-/// gRPC does not support request trailers.
-#[derive(Debug, Clone)]
-pub struct Trailers {
-    status: Status,
-    metadata: MetadataMap,
-}
-
-impl Trailers {
-    /// Returns a default [`Trailers`] instance.
-    pub fn new(status: Status) -> Self {
+impl ConnectionInfo {
+    /// Constructs a new instance with the given fields.
+    pub fn new(
+        local_address: Address,
+        remote_address: Address,
+        security_info: SecurityInfo,
+    ) -> Self {
         Self {
-            status,
-            metadata: MetadataMap::default(),
+            local_address,
+            remote_address,
+            security_info,
         }
     }
 
-    /// Replaces the status of self with `status`.
-    pub fn with_status(mut self, status: Status) -> Self {
-        self.status = status;
-        self
+    /// Returns the connection's local address.
+    pub fn local_address(&self) -> &Address {
+        &self.local_address
     }
 
-    /// Returns a reference to the [`Status`] contained in these trailers.
-    pub fn status(&self) -> &Status {
-        &self.status
+    /// Returns the peer's address.
+    pub fn remote_address(&self) -> &Address {
+        &self.remote_address
     }
 
-    /// Replaces the metadata of self with `metadata`.
-    pub fn with_metadata(mut self, metadata: MetadataMap) -> Self {
-        self.metadata = metadata;
-        self
+    /// Returns the connection's security information (e.g. TLS parameters).
+    pub fn security_info(&self) -> &SecurityInfo {
+        &self.security_info
     }
+}
 
-    /// Returns a mutable reference to the metadata in these trailers.
-    pub fn metadata_mut(&mut self) -> &mut MetadataMap {
-        &mut self.metadata
-    }
-
-    /// Returns a reference to the metadata in these trailers.
-    pub fn metadata(&self) -> &MetadataMap {
-        &self.metadata
-    }
-
-    /// Returns the status in the [`Trailers`], consuming the entire status.
-    pub fn into_status(self) -> Status {
-        self.status
+#[cfg(test)]
+pub(crate) fn test_connection_info() -> ConnectionInfo {
+    ConnectionInfo {
+        local_address: Address {
+            network_type: "",
+            address: ByteStr::default(),
+            attributes: Attributes::new(),
+        },
+        remote_address: Address {
+            network_type: "",
+            address: ByteStr::default(),
+            attributes: Attributes::new(),
+        },
+        security_info: SecurityInfo::new(""),
     }
 }

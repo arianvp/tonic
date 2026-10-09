@@ -25,32 +25,31 @@
 use std::marker::PhantomData;
 use std::pin::Pin;
 
-use grpc::Status;
-use grpc::StatusCode;
 use grpc::client::CallOptions;
 use grpc::client::InvokeOnce;
 use grpc::client::RecvStream;
+use grpc::client::RequestHeaders;
+use grpc::client::ResponseStreamItem;
 use grpc::client::SendOptions;
 use grpc::client::SendStream;
 use grpc::client::stream_util::RecvStreamValidator;
-use grpc::core::ClientResponseStreamItem;
-use grpc::core::RequestHeaders;
 use protobuf::AsMut;
 use protobuf::AsView;
-use protobuf::ClearAndParse;
 use protobuf::Message;
-use protobuf::MessageMut;
-use protobuf::MessageView;
 
-use crate::CallBuilder;
 use crate::ProtoRecvMessage;
 use crate::ProtoSendMessage;
+use crate::Status;
+use crate::StatusOr;
+use crate::client::CallBuilder;
 use crate::client::Internal;
+use crate::trailers_conv::status_from_trailers;
 
 /// Configures a client-streaming call for gRPC Protobuf.  Implements
-/// `IntoFuture` which begins the call and resolves to a `ClientStreamingCall`
-/// which allows sending request messages and receiving the response when done.
-/// Implements `CallBuilder` to provide common RPC configuration methods.
+/// [`IntoFuture`] which begins the call and resolves to a
+/// [`ClientStreamingCall`] which allows sending request messages and receiving
+/// the response when done. Implements [`CallBuilder`] to provide common RPC
+/// configuration methods.
 pub struct ClientStreamingCallBuilder<'a, C, Req, Res> {
     channel: C,
     method: String,
@@ -75,16 +74,8 @@ where
 impl<'a, C, Req, Res> IntoFuture for ClientStreamingCallBuilder<'a, C, Req, Res>
 where
     C: InvokeOnce + 'a,
-    // Req is a proto message. (Ideally we could just require "Message" and
-    // protobuf would automatically include the rest.  For now we need the
-    // HRTBs.)
     Req: Message,
-    for<'b> Req::View<'b>: MessageView<'b>,
-    // Res is a proto message. (Ideally we could just require "Message" and
-    // protobuf would automatically include the rest.  For now we need the
-    // HRTBs.)
-    Res: Message + ClearAndParse,
-    for<'b> Res::Mut<'b>: MessageMut<'b>,
+    Res: Message,
 {
     type Output = ClientStreamingCall<'a, C, Req, Res>;
     type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send + 'a>>;
@@ -134,16 +125,8 @@ pub struct ClientStreamingCall<'a, C: InvokeOnce, Req, Res> {
 impl<'a, C, Req, Res> ClientStreamingCall<'a, C, Req, Res>
 where
     C: InvokeOnce + 'a,
-    // Req is a proto message. (Ideally we could just require "Message" and
-    // protobuf would automatically include the rest.  For now we need the
-    // HRTBs.)
     Req: Message,
-    for<'b> Req::View<'b>: MessageView<'b>,
-    // Res is a proto message. (Ideally we could just require "Message" and
-    // protobuf would automatically include the rest.  For now we need the
-    // HRTBs.)
     Res: Message,
-    for<'b> Res::Mut<'b>: MessageMut<'b>,
 {
     /// Sends `message` on the stream.  Will block if flow control does not
     /// allow for sending the request message.  Returns an error if the stream
@@ -154,7 +137,7 @@ where
     /// Note: success does *not* indicate successful transmission of the request
     /// or successful receipt of the request by the server.  Success only
     /// indicates that the stream has not yet terminated.
-    pub async fn send_message(&mut self, message: &impl AsView<Proxied = Req>) -> Result<(), ()> {
+    pub async fn send(&mut self, message: &impl AsView<Proxied = Req>) -> Result<(), ()> {
         let msg = ProtoSendMessage::from_view(message);
         self.tx.send(&msg, SendOptions::default()).await
     }
@@ -166,40 +149,16 @@ where
         drop(tx);
         let mut res = ProtoRecvMessage::from_mut(res);
         loop {
-            let i = rx.next(&mut res).await;
-            if let ClientResponseStreamItem::Trailers(t) = i {
-                return t.into_status();
+            let i = rx.recv(&mut res).await;
+            if let ResponseStreamItem::Trailers(t) = i {
+                return status_from_trailers(t);
             }
         }
     }
-}
 
-impl<'a, C, Req, Res> IntoFuture for ClientStreamingCall<'a, C, Req, Res>
-where
-    C: InvokeOnce + 'a,
-    // Req is a proto message. (Ideally we could just require "Message" and
-    // protobuf would automatically include the rest.  For now we need the
-    // HRTBs.)
-    Req: Message,
-    for<'b> Req::View<'b>: MessageView<'b>,
-    // Res is a proto message. (Ideally we could just require "Message" and
-    // protobuf would automatically include the rest.  For now we need the
-    // HRTBs.)
-    Res: Message,
-    for<'b> Res::Mut<'b>: MessageMut<'b>,
-{
-    type Output = Result<Res, Status>;
-    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send + 'a>>;
-
-    fn into_future(self) -> Self::IntoFuture {
-        Box::pin(async move {
-            let mut res = Res::default();
-            let status = self.with_response_message(&mut res).await;
-            if status.code() == StatusCode::Ok {
-                Ok(res)
-            } else {
-                Err(status)
-            }
-        })
+    pub async fn close_and_recv(self) -> StatusOr<Res> {
+        let mut res = Res::default();
+        self.with_response_message(&mut res).await?;
+        Ok(res)
     }
 }

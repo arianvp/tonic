@@ -22,6 +22,8 @@
  *
  */
 
+//! Server-side gRPC [`rustls`] [`ServerCredentials`] implementation.
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -35,8 +37,8 @@ use tokio_rustls::TlsAcceptor;
 use tokio_rustls::TlsStream as RustlsStream;
 use webpki::EndEntityCert;
 
-use crate::attributes::Attributes;
 use crate::credentials::ProtocolInfo;
+use crate::credentials::SecurityInfo;
 use crate::credentials::SecurityLevel;
 use crate::credentials::ServerCredentials;
 use crate::credentials::rustls::ALPN_PROTO_STR_H2;
@@ -51,10 +53,9 @@ use crate::credentials::rustls::parse_key;
 use crate::credentials::rustls::sanitize_crypto_provider;
 use crate::credentials::rustls::tls_stream::TlsStream;
 use crate::credentials::server::HandshakeOutput;
-use crate::credentials::server::ServerConnectionSecurityInfo;
 use crate::private;
-use crate::rt::AsyncIoAdapter;
-use crate::rt::GrpcEndpoint;
+use crate::rt::BoxEndpoint;
+use crate::rt::EndpointIoStream;
 use crate::rt::GrpcRuntime;
 
 #[cfg(test)]
@@ -95,6 +96,8 @@ impl ResolvesServerCert for SniResolver {
     }
 }
 
+/// Settings for client certificate requests which may be made by
+/// [`RustlsServerCredentials`].
 #[non_exhaustive]
 pub enum TlsClientCertificateRequestType<R = StaticRootCertificatesProvider> {
     /// Server does not request client certificate.
@@ -116,7 +119,11 @@ pub enum TlsClientCertificateRequestType<R = StaticRootCertificatesProvider> {
     ///
     /// The client's key certificate pair must be valid for the TLS connection to
     /// be established.
-    RequestAndVerify { roots_provider: R },
+    RequestAndVerify {
+        /// The static root certificates provider to use to validate the clients
+        /// certs, if provided.
+        roots_provider: R,
+    },
 
     /// Server requests client certificate and enforces that the client presents a
     /// certificate.
@@ -127,7 +134,11 @@ pub enum TlsClientCertificateRequestType<R = StaticRootCertificatesProvider> {
     ///
     /// The client's key certificate pair must be valid for the TLS connection to
     /// be established.
-    RequireAndVerify { roots_provider: R },
+    RequireAndVerify {
+        /// The static root certificates provider to use to validate the clients
+        /// certs.
+        roots_provider: R,
+    },
 }
 
 enum InnerClientCertificateRequestType {
@@ -160,10 +171,14 @@ impl From<TlsClientCertificateRequestType> for InnerClientCertificateRequestType
     }
 }
 
+/// gRPC TLS [`ServerCredentials`] based on [`rustls`].
 #[derive(Clone)]
-pub struct RustlsServerTlsCredendials {
+pub struct RustlsServerCredentials {
     acceptor: TlsAcceptor,
 }
+
+#[deprecated(since = "0.10.0", note = "typo: use RustlsServerCredentials instead")]
+pub type RustlsServerCredendials = RustlsServerCredentials;
 
 /// Configuration for server-side TLS settings.
 pub struct ServerTlsConfig {
@@ -173,6 +188,9 @@ pub struct ServerTlsConfig {
 }
 
 impl ServerTlsConfig {
+    /// Creates a new rustls credentials configuration instance.  The instance
+    /// is not configured to request client certificates and does not log
+    /// session keys.
     pub fn new<I>(identities_provider: I) -> Self
     where
         I: Provider<IdentityList>,
@@ -205,8 +223,10 @@ impl ServerTlsConfig {
     }
 }
 
-impl RustlsServerTlsCredendials {
-    pub fn new(config: ServerTlsConfig) -> Result<RustlsServerTlsCredendials, String> {
+impl RustlsServerCredentials {
+    /// Constructs a new `RustlsServerCredentials` instance from the provided
+    /// configuration.
+    pub fn new(config: ServerTlsConfig) -> Result<RustlsServerCredentials, String> {
         let provider = if let Some(p) = CryptoProvider::get_default() {
             p.as_ref().clone()
         } else {
@@ -222,7 +242,7 @@ impl RustlsServerTlsCredendials {
     fn new_impl(
         mut config: ServerTlsConfig,
         provider: CryptoProvider,
-    ) -> Result<RustlsServerTlsCredendials, String> {
+    ) -> Result<RustlsServerCredentials, String> {
         let provider = sanitize_crypto_provider(provider)?;
         let id_list = config.identities_provider.borrow_and_update().clone();
         if id_list.is_empty() {
@@ -295,7 +315,7 @@ impl RustlsServerTlsCredendials {
         // Install a dummy ticketer that refuses to issue tickets.
         server_config.ticketer = Arc::new(NoTicketer);
 
-        Ok(RustlsServerTlsCredendials {
+        Ok(RustlsServerCredentials {
             acceptor: TlsAcceptor::from(Arc::new(server_config)),
         })
     }
@@ -320,16 +340,15 @@ impl ProducesTickets for NoTicketer {
     }
 }
 
-impl ServerCredentials for RustlsServerTlsCredendials {
-    type Output<Input> = TlsStream<Input>;
-
-    async fn accept<Input: GrpcEndpoint>(
+#[crate::async_trait]
+impl ServerCredentials for RustlsServerCredentials {
+    async fn accept(
         &self,
-        source: Input,
+        source: BoxEndpoint,
         _runtime: GrpcRuntime,
         _token: private::Internal,
-    ) -> Result<HandshakeOutput<Self::Output<Input>>, String> {
-        let input_io = AsyncIoAdapter::new(source);
+    ) -> Result<HandshakeOutput, String> {
+        let input_io = EndpointIoStream::new(source);
         let tls_stream = self
             .acceptor
             .accept(input_io)
@@ -341,14 +360,11 @@ impl ServerCredentials for RustlsServerTlsCredendials {
             return Err("Client ignored ALPN requirements".into());
         }
 
-        let auth_info = ServerConnectionSecurityInfo::new(
-            "tls",
-            SecurityLevel::PrivacyAndIntegrity,
-            Attributes::new(),
-        );
+        let auth_info =
+            SecurityInfo::new("tls").with_security_level(SecurityLevel::PrivacyAndIntegrity);
         let endpoint = TlsStream::new(RustlsStream::Server(tls_stream));
         Ok(HandshakeOutput {
-            endpoint,
+            endpoint: Box::new(endpoint),
             security: auth_info,
         })
     }

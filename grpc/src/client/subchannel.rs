@@ -33,33 +33,35 @@ use std::sync::Weak;
 use std::time::Duration;
 use std::time::Instant;
 
+use crate::async_trait;
 use tokio::sync::Notify;
 use tokio::sync::oneshot;
-use tonic::async_trait;
 
-use crate::Status;
-use crate::StatusCode;
+use crate::StatusCodeError;
+use crate::StatusError;
 use crate::client::CallOptions;
 use crate::client::ConnectivityState;
 use crate::client::DynInvoke;
 use crate::client::DynRecvStream;
 use crate::client::DynSendStream;
-use crate::client::channel::WorkQueueItem;
-use crate::client::channel::WorkQueueTx;
+use crate::client::RequestHeaders;
+use crate::client::load_balancing::WorkScheduler;
 use crate::client::load_balancing::subchannel::Subchannel;
 use crate::client::load_balancing::subchannel::SubchannelState;
+use crate::client::load_balancing::subchannel::SubchannelUpdate;
 use crate::client::load_balancing::subchannel::private::Sealed;
-use crate::client::name_resolution::Address;
 use crate::client::stream_util::FailingRecvStream;
 use crate::client::transport::DynTransport;
+use crate::client::transport::ProxyOptions;
 use crate::client::transport::SecurityOpts;
 use crate::client::transport::TransportOptions;
-use crate::core::RequestHeaders;
+use crate::client::transport::http_connect::HttpConnectHandshaker;
+use crate::core::Address;
+use crate::core::ConnectionInfo;
 use crate::credentials::call::CallDetails;
 use crate::credentials::call::ClientConnectionSecurityInfo as CallClientConnectionSecurityInfo;
-use crate::credentials::client::ClientConnectionSecurityContext;
-use crate::credentials::client::ClientConnectionSecurityInfo;
 use crate::credentials::common::Authority;
+use crate::private;
 use crate::rt::GrpcRuntime;
 
 type SharedInvoke = Arc<dyn DynInvoke>;
@@ -84,7 +86,7 @@ impl Backoff for NopBackoff {
 
 struct ReadyState {
     service: Box<dyn DynInvoke>,
-    security_info: ClientConnectionSecurityInfo<Box<dyn ClientConnectionSecurityContext>>,
+    connection_info: ConnectionInfo,
     authority: Authority,
 }
 
@@ -186,20 +188,22 @@ impl DynInvoke for InternalSubchannel {
             let creds = data
                 .security_opts
                 .credentials
-                .get_call_credentials()
+                .get_call_credentials(private::Internal)
                 .cloned();
 
             (state, creds)
         };
 
         let fail_with = |status| -> (Box<dyn DynSendStream>, Box<dyn DynRecvStream>) {
-            FailingRecvStream::new_stream_pair(status)
+            FailingRecvStream::new_stream_pair(status, Some(state.connection_info.clone()))
         };
 
         if let Some(call_creds) = call_creds {
-            if call_creds.minimum_channel_security_level() > state.security_info.security_level() {
-                return fail_with(Status::new(
-                    StatusCode::Unauthenticated,
+            if call_creds.minimum_channel_security_level()
+                > state.connection_info.security_info().security_level()
+            {
+                return fail_with(StatusError::new(
+                    StatusCodeError::Unauthenticated,
                     "transport: cannot send secure credentials on an insecure connection",
                 ));
             }
@@ -207,9 +211,9 @@ impl DynInvoke for InternalSubchannel {
             let call_details = create_call_details(&state.authority, headers.method_name());
 
             let channel_sec_info = CallClientConnectionSecurityInfo::new(
-                state.security_info.security_protocol(),
-                state.security_info.security_level(),
-                state.security_info.attributes().clone(),
+                state.connection_info.security_info().security_protocol(),
+                state.connection_info.security_info().security_level(),
+                state.connection_info.security_info().attributes().clone(),
             );
 
             if let Err(s) = call_creds
@@ -217,8 +221,8 @@ impl DynInvoke for InternalSubchannel {
                 .await
             {
                 let status = if s.is_restricted_control_plane_code() {
-                    Status::new(
-                        StatusCode::Internal,
+                    StatusError::new(
+                        StatusCodeError::Internal,
                         format!(
                             "transport: received call credentials error with illegal status: {}",
                             s.message()
@@ -243,9 +247,9 @@ pub(crate) struct InternalSubchannel {
 }
 
 struct InternalSubchannelData {
-    address: String,
+    address: Address,
     state: InternalSubchannelState,
-    work_queue: WorkQueueTx,
+    work_scheduler: Arc<dyn WorkScheduler>,
     on_drop: Arc<Notify>,
     transport_builder: Arc<dyn DynTransport>,
     backoff: Arc<dyn Backoff>,
@@ -264,9 +268,9 @@ impl InternalSubchannelData {
             return;
         };
 
-        _ = self
-            .work_queue
-            .send(WorkQueueItem::SubchannelStateUpdate { subchannel, state });
+        // Send the update directly to the subchannel's work scheduler.
+        self.work_scheduler
+            .schedule_work(Some(Box::new(SubchannelUpdate::new(subchannel, state))));
     }
 }
 
@@ -275,6 +279,10 @@ impl Sealed for InternalSubchannel {}
 impl Subchannel for InternalSubchannel {
     fn address(&self) -> Address {
         self.address.clone()
+    }
+
+    fn get_attribute_dyn(&self, _id: std::any::TypeId) -> Option<&dyn std::any::Any> {
+        None
     }
 
     fn connect(&self) {
@@ -302,28 +310,34 @@ impl InternalSubchannel {
         transport: Arc<dyn DynTransport>,
         backoff: Arc<dyn Backoff>,
         runtime: GrpcRuntime,
-        security_opts: SecurityOpts,
-        work_queue: WorkQueueTx,
+        mut security_opts: SecurityOpts,
+        work_scheduler: Arc<dyn WorkScheduler>,
     ) -> Arc<dyn Subchannel> {
         let on_drop = Arc::new(Notify::new());
-        let address_string = address.address.to_string();
+        if let Some(proxy_opts) = ProxyOptions::from_addr(&address) {
+            security_opts.credentials = Arc::new(HttpConnectHandshaker::new(
+                security_opts.credentials,
+                proxy_opts,
+            ));
+        }
         let this = Arc::new_cyclic(|weak_self| Self {
-            address,
+            address: address.clone(),
             on_drop: on_drop.clone(),
             data: Arc::new(Mutex::new(InternalSubchannelData {
-                address: address_string,
+                address,
                 transport_builder: transport,
                 backoff,
                 weak_self: weak_self.clone(),
                 runtime,
                 state: InternalSubchannelState::Idle,
-                work_queue,
+                work_scheduler,
                 on_drop,
                 transport_options: TransportOptions::default(), // TODO: should be configurable
                 security_opts,
             })),
         });
-        move_to_idle(&this.data);
+        // Do not report the initial state; the initial state is returned
+        // synchronously.
         this
     }
 
@@ -363,12 +377,12 @@ fn begin_connecting_if_idle(data: Arc<Mutex<InternalSubchannelData>>) {
             }
             _ = on_drop.notified() => {
             }
-            result = transport_builder.dyn_connect(address, runtime, &security_opts, &transport_opts) => {
+            result = transport_builder.dyn_connect(&address, runtime, &security_opts, &transport_opts) => {
                     match result {
-                        Ok((service, security_info, disconnection_listener)) => {
+                        Ok((service, connection_info, disconnection_listener)) => {
                             move_to_ready(data, Arc::new(ReadyState{
                                 service,
-                                security_info,
+                                connection_info,
                                 authority: security_opts.authority}), disconnection_listener).await;
                         }
                         Err(e) => {
@@ -440,13 +454,10 @@ fn create_call_details(authority: &Authority, full_method: &str) -> CallDetails 
     let (service, method) = full_method.rsplit_once('/').unwrap_or((full_method, ""));
     let host_str = authority.host();
 
-    let host = match authority.port() {
-        Some(443) | None => host_str.to_string(),
-        // Add [] for IPv6 addresses.
-        Some(port) if host_str.contains(':') => {
-            format!("[{}]:{}", host_str, port)
-        }
-        Some(port) => format!("{}:{}", host_str, port),
+    let host = if let Some(443) = authority.port() {
+        host_str.to_string()
+    } else {
+        authority.host_port_string()
     };
 
     CallDetails::new(format!("https://{}{}", host, service), method.to_string())

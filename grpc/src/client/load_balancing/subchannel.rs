@@ -23,6 +23,7 @@
  */
 
 use std::any::Any;
+use std::any::TypeId;
 use std::fmt::Debug;
 use std::fmt::Display;
 use std::hash::Hash;
@@ -32,42 +33,42 @@ use std::sync::Arc;
 use std::sync::Weak;
 
 use crate::client::ConnectivityState;
-use crate::client::name_resolution::Address;
+use crate::core::Address;
 
 /// Represents the current state of a Subchannel.
 #[derive(Debug, Clone)]
-pub(crate) struct SubchannelState {
+pub struct SubchannelState {
     /// The connectivity state of the subchannel.  See SubChannel for a
     /// description of the various states and their valid transitions.
-    pub(crate) connectivity_state: ConnectivityState,
+    pub connectivity_state: ConnectivityState,
     // Set if connectivity state is TransientFailure to describe the most recent
     // connection error.  None for any other connectivity_state value.
     pub last_connection_error: Option<String>,
 }
 
 impl SubchannelState {
-    pub(crate) fn idle() -> Self {
+    pub fn idle() -> Self {
         Self {
             connectivity_state: ConnectivityState::Idle,
             last_connection_error: None,
         }
     }
 
-    pub(crate) fn ready() -> Self {
+    pub fn ready() -> Self {
         Self {
             connectivity_state: ConnectivityState::Ready,
             last_connection_error: None,
         }
     }
 
-    pub(crate) fn connecting() -> Self {
+    pub fn connecting() -> Self {
         Self {
             connectivity_state: ConnectivityState::Connecting,
             last_connection_error: None,
         }
     }
 
-    pub(crate) fn transient_failure(last_connection_error: impl Into<String>) -> Self {
+    pub fn transient_failure(last_connection_error: impl Into<String>) -> Self {
         Self {
             connectivity_state: ConnectivityState::TransientFailure,
             last_connection_error: Some(last_connection_error.into()),
@@ -85,7 +86,30 @@ impl Display for SubchannelState {
     }
 }
 
-pub(crate) trait DynHash {
+/// Describes a state change of a subchannel.
+///
+/// This is delivered to an LB policy's
+/// [`work`](crate::client::load_balancing::LbPolicy::work) method as
+/// [`WorkData`](crate::client::load_balancing::WorkData) by the
+/// [`WorkScheduler`](crate::client::load_balancing::WorkScheduler) the policy
+/// provided when it created the subchannel via
+/// [`new_subchannel`](crate::client::load_balancing::ChannelController::new_subchannel).
+#[derive(Debug)]
+pub struct SubchannelUpdate {
+    /// The subchannel whose state changed.
+    pub subchannel: Arc<dyn Subchannel>,
+    /// The new state of the subchannel.
+    pub state: SubchannelState,
+}
+
+impl SubchannelUpdate {
+    /// Creates a new SubchannelUpdate.
+    pub fn new(subchannel: Arc<dyn Subchannel>, state: SubchannelState) -> Self {
+        Self { subchannel, state }
+    }
+}
+
+pub trait DynHash {
     #[allow(clippy::redundant_allocation)]
     fn dyn_hash(&self, state: &mut Box<&mut dyn Hasher>);
 }
@@ -96,7 +120,7 @@ impl<T: Hash> DynHash for T {
     }
 }
 
-pub(crate) trait DynPartialEq {
+pub trait DynPartialEq {
     fn dyn_eq(&self, other: &&dyn Any) -> bool;
 }
 
@@ -130,12 +154,15 @@ pub(crate) mod private {
 ///
 /// When a Subchannel is dropped, it is disconnected automatically, and no
 /// subsequent state updates will be provided for it to the LB policy.
-pub(crate) trait Subchannel:
-    private::Sealed + DynHash + DynPartialEq + Any + Send + Sync
-{
+pub trait Subchannel: private::Sealed + DynHash + DynPartialEq + Any + Send + Sync {
     /// Returns the address of the Subchannel.
     /// TODO: Consider whether this should really be public.
     fn address(&self) -> Address;
+
+    /// Returns the value of an attribute for this subchannel corresponding to
+    /// the `id`, or `None` if no attribute exists for it.  Values returned here
+    /// should not change over the life of the subchannel.
+    fn get_attribute_dyn(&self, id: TypeId) -> Option<&dyn Any>;
 
     /// Notifies the Subchannel to connect.
     fn connect(&self);
@@ -147,6 +174,15 @@ impl dyn Subchannel {
         T: 'static,
     {
         (self as &dyn Any).downcast_ref()
+    }
+
+    /// Returns the value of an attribute for this subchannel of the
+    /// corresponding `T` type, or `None` if no attribute exists for it.  This
+    /// method is a more type-friendly convenience wrapper around
+    /// [`Subchannel::get_attribute_dyn`].
+    pub fn get_attribute<T: 'static>(&self) -> Option<&T> {
+        self.get_attribute_dyn(TypeId::of::<T>())
+            .and_then(|any| any.downcast_ref::<T>())
     }
 }
 
@@ -177,7 +213,7 @@ impl Display for dyn Subchannel {
 }
 
 #[derive(Debug)]
-pub(crate) struct WeakSubchannel(Weak<dyn Subchannel>);
+pub struct WeakSubchannel(Weak<dyn Subchannel>);
 
 impl From<&Arc<dyn Subchannel>> for WeakSubchannel {
     fn from(subchannel: &Arc<dyn Subchannel>) -> Self {
@@ -213,14 +249,19 @@ impl PartialEq for WeakSubchannel {
 
 impl Eq for WeakSubchannel {}
 
-pub(crate) trait ForwardingSubchannel: DynHash + DynPartialEq + Any + Send + Sync {
+pub trait ForwardingSubchannel: DynHash + DynPartialEq + Any + Send + Sync {
     fn delegate(&self) -> &Arc<dyn Subchannel>;
 
     fn address(&self) -> Address {
         self.delegate().address()
     }
+
+    fn get_attribute_dyn(&self, id: TypeId) -> Option<&dyn Any> {
+        self.delegate().get_attribute_dyn(id)
+    }
+
     fn connect(&self) {
-        self.delegate().connect()
+        self.delegate().connect();
     }
 }
 
@@ -228,8 +269,13 @@ impl<T: ForwardingSubchannel> Subchannel for T {
     fn address(&self) -> Address {
         self.address()
     }
+
+    fn get_attribute_dyn(&self, id: TypeId) -> Option<&dyn Any> {
+        self.get_attribute_dyn(id)
+    }
+
     fn connect(&self) {
-        self.connect()
+        self.connect();
     }
 }
 impl<T: ForwardingSubchannel> private::Sealed for T {}

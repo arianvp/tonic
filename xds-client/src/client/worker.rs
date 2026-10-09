@@ -1,3 +1,27 @@
+/*
+ *
+ * Copyright 2025 gRPC authors.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
+ */
+
 //! ADS worker that manages the xDS stream.
 //!
 //! The worker runs as a background task, managing:
@@ -6,7 +30,8 @@
 //! - Dispatching resources to watchers
 //! - ACK/NACK protocol
 
-use std::collections::{HashMap, HashSet};
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -20,9 +45,179 @@ use crate::client::watch::{ProcessingDone, ResourceEvent};
 use crate::codec::XdsCodec;
 use crate::error::{Error, Result};
 use crate::message::{DiscoveryRequest, DiscoveryResponse, ErrorDetail, Node};
+use crate::metrics::{self, KeyValue, MetricsRecorder};
 use crate::resource::{DecodedResource, DecoderFn};
 use crate::runtime::Runtime;
-use crate::transport::{Transport, TransportBuilder, TransportStream};
+use crate::transport::{Transport, TransportBuilder, TransportReceiver, TransportSender};
+
+/// Per-client A78 metric attributes (`grpc.target` + `grpc.xds.server`).
+///
+/// Both values are stored as `Arc<str>` so each emission clones them as a
+/// cheap atomic op (via the `StringValue::RefCounted` variant) instead of
+/// allocating a new `String` per attribute slot.
+struct ClientAttrs {
+    target: Arc<str>,
+    server: Arc<str>,
+}
+
+impl ClientAttrs {
+    /// Sentinel `grpc.xds.authority` value used for the unnamed top-level
+    /// (non-federated) authority.
+    ///
+    /// Matches grpc-go's top-level placeholder.
+    ///
+    /// TODO: once federated bootstrap support lands, derive the authority from
+    /// the resource name (`xdstp://<authority>/...`) on a per-resource basis.
+    const TOP_LEVEL_AUTHORITY: &'static str = "#old";
+
+    fn connection_attrs(&self) -> [KeyValue; 2] {
+        [
+            KeyValue::str(metrics::attrs::GRPC_TARGET, Arc::clone(&self.target)),
+            KeyValue::str(metrics::attrs::GRPC_XDS_SERVER, Arc::clone(&self.server)),
+        ]
+    }
+
+    fn type_attrs(&self, type_url: &Arc<str>) -> [KeyValue; 3] {
+        [
+            KeyValue::str(metrics::attrs::GRPC_TARGET, Arc::clone(&self.target)),
+            KeyValue::str(metrics::attrs::GRPC_XDS_SERVER, Arc::clone(&self.server)),
+            KeyValue::str(metrics::attrs::GRPC_XDS_RESOURCE_TYPE, Arc::clone(type_url)),
+        ]
+    }
+
+    fn cache_state_attrs(&self, type_url: &Arc<str>, cache_state: &'static str) -> [KeyValue; 4] {
+        [
+            KeyValue::str(metrics::attrs::GRPC_TARGET, Arc::clone(&self.target)),
+            KeyValue::str(
+                metrics::attrs::GRPC_XDS_AUTHORITY,
+                Self::TOP_LEVEL_AUTHORITY,
+            ),
+            KeyValue::str(metrics::attrs::GRPC_XDS_RESOURCE_TYPE, Arc::clone(type_url)),
+            KeyValue::str(metrics::attrs::GRPC_XDS_CACHE_STATE, cache_state),
+        ]
+    }
+}
+
+/// Worker-side wrapper around an optional [`MetricsRecorder`] backend.
+pub(crate) struct RecorderHandle {
+    recorder: Option<Arc<dyn MetricsRecorder>>,
+    attrs: ClientAttrs,
+    /// Last-emitted `grpc.xds_client.resources` gauge value per
+    /// `resource_type -> cache_state`. Used to diff against the live
+    /// cache snapshot so we only push buckets whose count changed; the cache in
+    /// the worker remains the single source of truth.
+    resource_counts: HashMap<Arc<str>, HashMap<&'static str, i64>>,
+}
+
+impl RecorderHandle {
+    pub(crate) fn new(recorder: Option<Arc<dyn MetricsRecorder>>, target: Arc<str>) -> Self {
+        Self {
+            recorder,
+            attrs: ClientAttrs {
+                target,
+                server: Arc::from(""),
+            },
+            resource_counts: HashMap::new(),
+        }
+    }
+
+    /// Update the `grpc.xds.server` attribute for subsequent emissions.
+    pub(crate) fn set_server(&mut self, server: Arc<str>) {
+        self.attrs.server = server;
+    }
+
+    /// `grpc.xds_client.connected` — 1 for connected, 0 for disconnected.
+    fn record_connected(&self, connected: bool) {
+        let Some(recorder) = &self.recorder else {
+            return;
+        };
+        recorder.record_gauge_i64(
+            &metrics::instruments::XDS_CLIENT_CONNECTED,
+            if connected { 1 } else { 0 },
+            &self.attrs.connection_attrs(),
+        );
+    }
+
+    /// `grpc.xds_client.server_failure` — incremented once per failed connection cycle.
+    fn record_server_failure(&self) {
+        let Some(recorder) = &self.recorder else {
+            return;
+        };
+        recorder.add_counter_u64(
+            &metrics::instruments::XDS_CLIENT_SERVER_FAILURE,
+            1,
+            &self.attrs.connection_attrs(),
+        );
+    }
+
+    /// `grpc.xds_client.resource_updates_valid` + `_invalid`, with aggregated
+    /// counts from a single response.
+    fn record_resource_updates(&self, type_url: &Arc<str>, valid: u64, invalid: u64) {
+        let Some(recorder) = &self.recorder else {
+            return;
+        };
+        if valid == 0 && invalid == 0 {
+            return;
+        }
+        let type_attrs = self.attrs.type_attrs(type_url);
+        if valid > 0 {
+            recorder.add_counter_u64(
+                &metrics::instruments::XDS_CLIENT_RESOURCE_UPDATES_VALID,
+                valid,
+                &type_attrs,
+            );
+        }
+        if invalid > 0 {
+            recorder.add_counter_u64(
+                &metrics::instruments::XDS_CLIENT_RESOURCE_UPDATES_INVALID,
+                invalid,
+                &type_attrs,
+            );
+        }
+    }
+
+    /// Reconcile the `grpc.xds_client.resources` gauge for `type_url` against an
+    /// authoritative cache snapshot (`cache_state` label -> current count).
+    ///
+    /// The worker's resource cache is the single source of truth; this only
+    /// diffs the snapshot against the values last emitted for `type_url` and
+    /// pushes the buckets that changed. Buckets that dropped out of the snapshot
+    /// are pushed as `0`, because a push gauge would otherwise retain a stale
+    /// non-zero reading for a bucket that has emptied. Idempotent: calling it
+    /// with an unchanged snapshot emits nothing.
+    fn sync_resource_counts(&mut self, type_url: &Arc<str>, counts: &HashMap<&'static str, i64>) {
+        let Some(recorder) = &self.recorder else {
+            return;
+        };
+        let last = self
+            .resource_counts
+            .entry(Arc::clone(type_url))
+            .or_default();
+
+        // New or changed buckets.
+        for (&state, &count) in counts {
+            if last.get(&state) != Some(&count) {
+                recorder.record_gauge_i64(
+                    &metrics::instruments::XDS_CLIENT_RESOURCES,
+                    count,
+                    &self.attrs.cache_state_attrs(type_url, state),
+                );
+            }
+        }
+        // Buckets that emptied since the last snapshot — reset to 0.
+        for &state in last.keys() {
+            if !counts.contains_key(&state) {
+                recorder.record_gauge_i64(
+                    &metrics::instruments::XDS_CLIENT_RESOURCES,
+                    0,
+                    &self.attrs.cache_state_attrs(type_url, state),
+                );
+            }
+        }
+
+        *last = counts.clone();
+    }
+}
 
 /// Global counter for generating unique watcher IDs.
 static NEXT_WATCHER_ID: AtomicU64 = AtomicU64::new(1);
@@ -114,6 +309,21 @@ enum ResourceState {
     DoesNotExist,
 }
 
+impl ResourceState {
+    /// Canonical A78 `grpc.xds.cache_state` attribute value for this state.
+    ///
+    /// When gRFC A88 (data error caching) is implemented, a `NACKedButCached`
+    /// variant will map to `"nacked_but_cached"` here.
+    fn cache_state_label(&self) -> &'static str {
+        match self {
+            ResourceState::Requested => "requested",
+            ResourceState::Received => "acked",
+            ResourceState::NACKed(_) => "nacked",
+            ResourceState::DoesNotExist => "does_not_exist",
+        }
+    }
+}
+
 /// A cached resource entry.
 #[derive(Debug, Clone)]
 struct CachedResource {
@@ -165,7 +375,8 @@ impl CachedResource {
     /// Convert cached state to a ResourceEvent for notifying watchers.
     /// Returns None if state is Requested (nothing to notify yet).
     fn to_event(&self) -> Option<ResourceEvent<DecodedResource>> {
-        let (done, _rx) = ProcessingDone::channel();
+        // Cache-dump events for new watchers do not gate flow control.
+        let done = ProcessingDone::detached();
         match &self.state {
             ResourceState::Received => {
                 self.resource
@@ -190,6 +401,9 @@ impl CachedResource {
 
 /// Per-type_url state tracking.
 struct TypeState {
+    /// Reference-counted type URL, shared with metric attribute slots so
+    /// per-emission attribute construction is a cheap.
+    type_url: Arc<str>,
     /// Decoder function for this resource type.
     decoder: DecoderFn,
     /// Version from last successful response.
@@ -209,6 +423,7 @@ struct TypeState {
 impl std::fmt::Debug for TypeState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TypeState")
+            .field("type_url", &self.type_url)
             .field("decoder", &"<decoder fn>")
             .field("version_info", &self.version_info)
             .field("nonce", &self.nonce)
@@ -224,8 +439,9 @@ impl std::fmt::Debug for TypeState {
 }
 
 impl TypeState {
-    fn new(decoder: DecoderFn, all_resources_required_in_sotw: bool) -> Self {
+    fn new(type_url: Arc<str>, decoder: DecoderFn, all_resources_required_in_sotw: bool) -> Self {
         Self {
+            type_url,
             decoder,
             version_info: String::new(),
             nonce: String::new(),
@@ -270,6 +486,17 @@ impl TypeState {
             .filter(|e| e.subscription.matches(name))
             .map(|e| e.event_tx.clone())
             .collect()
+    }
+
+    /// Current number of cached resources in each `grpc.xds.cache_state`, keyed
+    /// by the canonical state label. States with no resources are omitted; this
+    /// is the authoritative snapshot for the `grpc.xds_client.resources` gauge.
+    fn resource_state_counts(&self) -> HashMap<&'static str, i64> {
+        let mut counts: HashMap<&'static str, i64> = HashMap::new();
+        for cached in self.cache.values() {
+            *counts.entry(cached.state.cache_state_label()).or_insert(0) += 1;
+        }
+        counts
     }
 }
 
@@ -333,8 +560,8 @@ pub(crate) struct AdsWorker<TB, C, R> {
     servers: Vec<ServerConfig>,
     /// Timeout for initial resource response (gRFC A57). None = disabled.
     resource_initial_timeout: Option<Duration>,
-    /// Sender for timer callback commands.
-    command_tx: mpsc::Sender<WorkerCommand>,
+    /// Weak sender for timer callback commands, so AdsWorker does not keep its own channel open.
+    command_tx: mpsc::WeakSender<WorkerCommand>,
     /// Receiver for commands from XdsClient.
     command_rx: mpsc::Receiver<WorkerCommand>,
     /// Per-type_url state.
@@ -342,6 +569,20 @@ pub(crate) struct AdsWorker<TB, C, R> {
     /// Cancellation handles for resource timers (gRFC A57).
     /// Key is (type_url, resource_name). Dropping the sender cancels the timer.
     resource_timers: HashMap<(String, String), oneshot::Sender<()>>,
+    /// Optional backend + per-client A78 metric attributes
+    /// (`grpc.target` + `grpc.xds.server`).
+    recorder: RecorderHandle,
+}
+
+/// Outcome of a connected ADS session (see [`AdsWorker::run_connected`]).
+enum ConnectedOutcome {
+    /// All `XdsClient` handles were dropped; the worker should shut down.
+    Shutdown,
+    /// The ADS stream failed; the worker should reconnect. `saw_response`
+    /// indicates whether at least one response was received before the failure
+    /// — per gRFC A78, a stream that fails after a response is not counted as a
+    /// server failure.
+    Failed { saw_response: bool },
 }
 
 impl<TB, C, R> AdsWorker<TB, C, R>
@@ -358,7 +599,9 @@ where
         config: ClientConfig,
         command_tx: mpsc::Sender<WorkerCommand>,
         command_rx: mpsc::Receiver<WorkerCommand>,
+        recorder: Option<Arc<dyn MetricsRecorder>>,
     ) -> Self {
+        let target: Arc<str> = Arc::from(config.target.unwrap_or_default());
         Self {
             transport_builder,
             codec,
@@ -367,10 +610,11 @@ where
             backoff: Backoff::new(config.retry_policy),
             servers: config.servers,
             resource_initial_timeout: config.resource_initial_timeout,
-            command_tx,
+            command_tx: command_tx.downgrade(),
             command_rx,
             type_states: HashMap::new(),
             resource_timers: HashMap::new(),
+            recorder: RecorderHandle::new(recorder, target),
         }
     }
 
@@ -379,18 +623,27 @@ where
     /// This method runs until all `XdsClient` handles are dropped
     /// (which closes the command channel).
     pub(crate) async fn run(mut self) {
-        loop {
+        // Future extension (gRFC A71): Try servers in priority order with fallback.
+        let server = match self.servers.first() {
+            Some(s) => s.clone(),
+            None => return, // No servers configured
+        };
+        self.recorder.set_server(Arc::from(server.uri()));
+
+        // gRFC A78 defines `grpc.xds_client.connected` to be initialized as
+        // "For a given server, set to 1 when the stream is initially created."
+        let mut healthy = true;
+        self.recorder.record_connected(true);
+        'outer: loop {
             // Wait for at least one subscription before connecting.
             // This prevents deadlock with servers that require a message before
             // sending response headers - we need something to send.
             while self.type_states.is_empty() {
                 match self.command_rx.recv().await {
                     Some(cmd) => {
-                        let _ = self
-                            .handle_command::<<TB::Transport as Transport>::Stream>(None, cmd)
-                            .await;
+                        let _ = self.handle_command(None, cmd).await;
                     }
-                    None => return,
+                    None => break 'outer,
                 }
             }
 
@@ -400,57 +653,81 @@ where
             }
 
             // Connect to server.
-            // Future extension (gRFC A71): Try servers in priority order with fallback.
-            let server = match self.servers.first() {
-                Some(s) => s,
-                None => return, // No servers configured
-            };
-
-            let transport = match self.transport_builder.build(server).await {
+            let transport = match self.transport_builder.build(&server).await {
                 Ok(t) => t,
                 Err(_) => {
+                    self.record_unhealthy(&mut healthy);
                     match self.backoff.next_backoff() {
                         Some(backoff) => self.runtime.sleep(backoff).await,
-                        None => return, // Max attempts exceeded
+                        None => break, // Max attempts exceeded
                     }
                     continue;
                 }
             };
 
-            let stream = match transport.new_stream(self.build_initial_requests()).await {
-                Ok(s) => {
-                    self.backoff.reset();
-                    s
-                }
+            let (tx, rx) = match transport.new_stream().await {
+                Ok(s) => s,
                 Err(_) => {
+                    self.record_unhealthy(&mut healthy);
                     match self.backoff.next_backoff() {
                         Some(backoff) => self.runtime.sleep(backoff).await,
-                        None => return, // Max attempts exceeded
+                        None => break, // Max attempts exceeded
                     }
                     continue;
                 }
             };
 
-            match self.run_connected(stream).await {
-                Ok(()) => return, // shutdown
-                Err(_e) => {
+            match self.run_connected(tx, rx, &mut healthy).await {
+                ConnectedOutcome::Shutdown => break,
+                ConnectedOutcome::Failed { saw_response } => {
+                    // gRFC A78: a server goes unhealthy (one `server_failure`) on
+                    // a connectivity failure or when the ADS stream fails
+                    // *without* seeing a response message. A stream that failed
+                    // after receiving a response is not counted; just reconnect.
+                    if saw_response {
+                        self.backoff.reset();
+                    } else {
+                        self.record_unhealthy(&mut healthy);
+                    }
                     match self.backoff.next_backoff() {
                         Some(backoff) => self.runtime.sleep(backoff).await,
-                        None => return, // Max attempts exceeded
+                        None => break, // Max attempts exceeded
                     }
                     continue;
                 }
             }
         }
+        if healthy {
+            self.recorder.record_connected(false);
+        }
     }
 
-    /// Build initial DiscoveryRequests for all active subscriptions.
-    ///
-    /// These are sent when establishing the stream to prevent deadlock with
-    /// servers that don't send response headers until they receive a request.
-    fn build_initial_requests(&self) -> Vec<Bytes> {
-        let mut requests = Vec::new();
+    /// Record an xDS server transition to healthy (gRFC A78
+    /// `grpc.xds_client.connected`). Sets the `connected` gauge to 1, but only
+    /// on the unhealthy -> healthy edge, so repeated reconnect attempts during
+    /// a single outage are not counted.
+    fn record_healthy(&self, healthy: &mut bool) {
+        if !*healthy {
+            self.recorder.record_connected(true);
+            *healthy = true;
+        }
+    }
 
+    /// Record an xDS server transition to unhealthy (gRFC A78
+    /// `grpc.xds_client.server_failure`). Increments the `server_failure`
+    /// counter and drops the `connected` gauge to 0, but only on the
+    /// healthy -> unhealthy edge, so repeated reconnect attempts during a single
+    /// outage are not counted.
+    fn record_unhealthy(&self, healthy: &mut bool) {
+        if *healthy {
+            self.recorder.record_server_failure();
+            self.recorder.record_connected(false);
+            *healthy = false;
+        }
+    }
+
+    /// Send initial DiscoveryRequests for all active subscriptions.
+    fn send_initial_requests(&self, sender: &mpsc::UnboundedSender<Bytes>) -> Result<()> {
         for (type_url, type_state) in &self.type_states {
             if type_state.watchers.is_empty() {
                 continue;
@@ -467,51 +744,119 @@ where
                 error_detail: None,
             };
 
-            if let Ok(bytes) = self.codec.encode_request(&request) {
-                requests.push(bytes);
-            }
+            let bytes = self.codec.encode_request(&request)?;
+            sender.send(bytes).map_err(|_| Error::StreamClosed)?;
         }
 
-        requests
+        Ok(())
     }
 
     /// Run the main event loop while connected.
     ///
-    /// Returns `Ok(())` if the worker should shut down (command channel closed).
-    /// Returns `Err` if an error occurred and the worker should reconnect.
-    async fn run_connected<S: TransportStream>(&mut self, mut stream: S) -> Result<()> {
+    /// Returns [`ConnectedOutcome::Shutdown`] if the worker should shut down
+    /// (command channel closed), or [`ConnectedOutcome::Failed`] if the stream
+    /// failed and the worker should reconnect (carrying whether a response was
+    /// seen, per gRFC A78).
+    async fn run_connected(
+        &mut self,
+        tx: <TB::Transport as Transport>::Sender,
+        rx: <TB::Transport as Transport>::Receiver,
+        healthy: &mut bool,
+    ) -> ConnectedOutcome {
+        let (write_tx, write_rx) = mpsc::unbounded_channel::<Bytes>();
+        let (read_tx, mut read_rx) = mpsc::channel(1);
+        self.runtime
+            .spawn(Self::run_stream_task(tx, rx, write_rx, read_tx));
+
+        // Send initial DiscoveryRequests for all active subscriptions on this new stream:
+        if self.send_initial_requests(&write_tx).is_err() {
+            return ConnectedOutcome::Failed {
+                saw_response: false,
+            };
+        }
+
+        // Whether at least one response was received on this stream. Per gRFC
+        // A78 a stream that fails *after* receiving a response is not counted as
+        // a server failure.
+        let mut saw_response = false;
         loop {
             tokio::select! {
-                result = stream.recv() => {
-                    match result {
-                        Ok(Some(bytes)) => {
-                            self.handle_response(&mut stream, bytes).await?;
+                res = read_rx.recv() => {
+                    match res {
+                        Some((bytes, done)) => {
+                            let response = match self.codec.decode_response(bytes) {
+                                Ok(response) => response,
+                                Err(_) => return ConnectedOutcome::Failed { saw_response },
+                            };
+                            saw_response = true;
+                            self.record_healthy(healthy);
+                            if self.handle_response(&write_tx, response, done).await.is_err() {
+                                // All errors are related to sending a request, not `response` whose
+                                // problems are handled by notifying the server.
+                                return ConnectedOutcome::Failed { saw_response };
+                            }
                         }
-                        // Stream closed by server; return Err to trigger reconnection
-                        Ok(None) => return Err(Error::StreamClosed),
-                        Err(e) => return Err(e),
+                        None => return ConnectedOutcome::Failed { saw_response },
                     }
                 }
-
                 cmd = self.command_rx.recv() => {
                     match cmd {
                         Some(cmd) => {
-                            self.handle_command(Some(&mut stream), cmd).await?;
+                            if self.handle_command(Some(&write_tx), cmd).await.is_err() {
+                                return ConnectedOutcome::Failed { saw_response };
+                            }
                         }
-                        None => return Ok(()),
+                        None => return ConnectedOutcome::Shutdown,
                     }
                 }
             }
+        }
+    }
+
+    /// Background task that handles reading from and writing to the ADS stream.
+    ///
+    /// The task has essentially no state. It reads from an unbounded channel and
+    /// writes whatever it reads to the stream. When it reads a message from the
+    /// stream, it forwards it to `read_tx` along with a `ProcessingDone` token,
+    /// and blocks reading from the stream until the token and all shares are
+    /// dropped (ADS flow control). Writes from the unbounded channel continue while
+    /// waiting for `done`.
+    async fn run_stream_task(
+        mut tx: <TB::Transport as Transport>::Sender,
+        mut rx: <TB::Transport as Transport>::Receiver,
+        mut write_rx: mpsc::UnboundedReceiver<Bytes>,
+        read_tx: mpsc::Sender<(Bytes, ProcessingDone)>,
+    ) {
+        let write_loop = async {
+            while let Some(bytes) = write_rx.recv().await {
+                if tx.send(bytes).await.is_err() {
+                    break;
+                }
+            }
+        };
+        let read_loop = async {
+            while let Ok(Some(bytes)) = rx.recv().await {
+                let (done, done_rx) = ProcessingDone::channel();
+                if read_tx.send((bytes, done)).await.is_err() {
+                    break;
+                }
+                let _ = done_rx.await;
+            }
+        };
+        tokio::select! {
+            _ = write_loop => {}
+            _ = read_loop => {}
         }
     }
 
     /// Handle a command, optionally sending network requests if connected.
     ///
-    /// When `stream` is `None`, only state updates are performed (disconnected mode).
-    /// When `stream` is `Some`, subscription changes trigger network requests.
-    async fn handle_command<S: TransportStream>(
+    /// When `sender` is `None`, only state updates are performed (disconnected mode).
+    /// When `sender` is `Some`, subscription changes trigger network requests via
+    /// the unbounded write channel.
+    async fn handle_command(
         &mut self,
-        stream: Option<&mut S>,
+        sender: Option<&mpsc::UnboundedSender<Bytes>>,
         cmd: WorkerCommand,
     ) -> Result<()> {
         match cmd {
@@ -530,16 +875,16 @@ where
                     event_tx,
                     decoder,
                     all_resources_required_in_sotw,
-                ) && let Some(stream) = stream
+                ) && let Some(sender) = sender
                 {
-                    self.send_request(stream, type_url).await?;
+                    self.send_request(sender, type_url)?;
                 }
             }
             WorkerCommand::Unwatch { watcher_id } => {
                 if let Some((type_url, true)) = self.remove_watcher(watcher_id)
-                    && let Some(stream) = stream
+                    && let Some(sender) = sender
                 {
-                    self.send_request(stream, &type_url).await?;
+                    self.send_request(sender, &type_url)?;
                 }
             }
             WorkerCommand::ResourceTimerExpired { type_url, name } => {
@@ -566,21 +911,72 @@ where
         let type_state = self
             .type_states
             .entry(type_url_string.clone())
-            .or_insert_with(|| TypeState::new(decoder, all_resources_required_in_sotw));
+            .or_insert_with(|| {
+                TypeState::new(Arc::from(type_url), decoder, all_resources_required_in_sotw)
+            });
 
         let old_subscription = type_state.subscription.clone();
         let watcher_subscription = WatcherSubscription::from_name(name.clone());
 
+        // Wildcard subscriptions can receive an unbounded number of resources
+        // in a single SotW response. Spawn a task that drains the worker's
+        // bounded channel into an unbounded queue and forwards events to the
+        // watcher's bounded channel, so the worker never blocks waiting for the
+        // watcher to drain.
+        let event_tx = if watcher_subscription.is_wildcard() {
+            // Channel has arbitrary size
+            let (worker_tx, mut worker_rx) = mpsc::channel(128);
+            self.runtime.spawn(async move {
+                let mut queue = VecDeque::new();
+                loop {
+                    tokio::select! {
+                        event = worker_rx.recv() => {
+                            match event {
+                                Some(event) => queue.push_back(event),
+                                None => {
+                                    while let Some(event) = queue.pop_front() {
+                                        if event_tx.send(event).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        res = event_tx.reserve(), if !queue.is_empty() => {
+                            match res {
+                                Ok(permit) => {
+                                    if let Some(event) = queue.pop_front() {
+                                        permit.send(event);
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        _ = event_tx.closed(), if queue.is_empty() => break,
+                    }
+                }
+            });
+            worker_tx
+        } else {
+            event_tx
+        };
+
         // Track if we need to start a timer (resource in Requested state)
         let mut start_timer_for: Option<String> = None;
+        // Track newly-inserted cache entry for the resources gauge (None -> Requested).
+        let mut was_new = false;
 
         // For named subscriptions, check cache and send cached state to new watcher.
         // For wildcard subscriptions, watchers receive updates as they come in.
         if let WatcherSubscription::Named(ref resource_name) = watcher_subscription {
-            let cached = type_state
-                .cache
-                .entry(resource_name.clone())
-                .or_insert_with(CachedResource::requested);
+            let cached = match type_state.cache.entry(resource_name.clone()) {
+                Entry::Vacant(v) => {
+                    was_new = true;
+                    v.insert(CachedResource::requested())
+                }
+                Entry::Occupied(o) => o.into_mut(),
+            };
 
             if let Some(event) = cached.to_event() {
                 // Send cached state to watcher (non-blocking, ignore if full)
@@ -603,6 +999,13 @@ where
         type_state.recalculate_subscriptions();
 
         let subscriptions_changed = type_state.subscription != old_subscription;
+
+        // Reconcile the resources gauge from the updated cache.
+        if was_new {
+            let counts = type_state.resource_state_counts();
+            self.recorder
+                .sync_resource_counts(&type_state.type_url, &counts);
+        }
 
         // Start timer if resource is in Requested state
         if let (Some(resource_name), Some(timeout)) =
@@ -633,7 +1036,11 @@ where
         let subscriptions_changed = type_state.subscription != old_subscription;
 
         if type_state.watchers.is_empty() {
+            let type_url_arc = Arc::clone(&type_state.type_url);
             self.type_states.remove(&type_url);
+            // The type is gone — reset all of its resource buckets to zero.
+            self.recorder
+                .sync_resource_counts(&type_url_arc, &HashMap::new());
             // Cancel all pending resource timers for this type.
             self.resource_timers.retain(|key, _| key.0 != type_url);
         }
@@ -641,8 +1048,8 @@ where
         Some((type_url, subscriptions_changed))
     }
 
-    /// Send a DiscoveryRequest for a type.
-    async fn send_request<S: TransportStream>(&self, stream: &mut S, type_url: &str) -> Result<()> {
+    /// Send a DiscoveryRequest for a type to the unbounded write channel.
+    fn send_request(&self, sender: &mpsc::UnboundedSender<Bytes>, type_url: &str) -> Result<()> {
         let type_state = match self.type_states.get(type_url) {
             Some(s) => s,
             None => return Ok(()),
@@ -659,10 +1066,12 @@ where
         };
 
         let bytes = self.codec.encode_request(&request)?;
-        stream.send(bytes).await
+        sender.send(bytes).map_err(|_| Error::StreamClosed)?;
+        Ok(())
     }
 
-    /// Handle a response from the server.
+    /// Handle a response from the server. Problems with `response` will be handled directly, and
+    /// not cause an `Err` return.
     ///
     /// Implements partial success per gRFC A46: valid resources are accepted even
     /// if some resources in the response fail validation. Each resource is processed
@@ -670,16 +1079,23 @@ where
     /// - Valid resources are cached and dispatched to watchers
     /// - Invalid resources are cached as NACKed and errors sent to specific watchers
     /// - Missing resources (for types with ALL_RESOURCES_REQUIRED_IN_SOTW) are marked deleted
-    async fn handle_response<S: TransportStream>(
+    ///
+    /// Cache/state updates and the ACK/NACK happen here, followed by sending
+    /// watcher notifications inline. Because ADS flow control (`ProcessingDone`)
+    /// is awaited in `run_stream_task` before reading the next message, at most
+    /// one response is in flight at a time, and wildcard watches buffer events
+    /// in an unbounded queue, so sending notifications directly cannot fill
+    /// a watcher channel or deadlock.
+    async fn handle_response(
         &mut self,
-        stream: &mut S,
-        bytes: Bytes,
+        sender: &mpsc::UnboundedSender<Bytes>,
+        response: DiscoveryResponse,
+        done: ProcessingDone,
     ) -> Result<()> {
-        let response = self.codec.decode_response(bytes)?;
         let type_url = response.type_url.clone();
 
-        let decoder = match self.type_states.get(&type_url) {
-            Some(s) => &s.decoder,
+        let (type_url_arc, decoder) = match self.type_states.get(&type_url) {
+            Some(s) => (Arc::clone(&s.type_url), &s.decoder),
             None => {
                 return Ok(());
             }
@@ -708,6 +1124,13 @@ where
             }
         }
 
+        // Emit A78 resource_updates_valid/invalid counters once per response with
+        // aggregated counts (equivalent to per-resource increments in any backend).
+        let valid_count = valid_resources.len() as u64;
+        let invalid_count = (top_level_errors.len() + per_resource_errors.len()) as u64;
+        self.recorder
+            .record_resource_updates(&type_url_arc, valid_count, invalid_count);
+
         if let Some(type_state) = self.type_states.get_mut(&type_url) {
             type_state.nonce = response.nonce.clone();
         }
@@ -717,27 +1140,21 @@ where
             .map(|r| r.name().to_string())
             .collect();
 
-        let mut processing_done_futures = self.dispatch_resources(&type_url, valid_resources).await;
+        self.dispatch_resources(&type_url, valid_resources, &done)
+            .await;
 
         // Only notify watchers for per-resource errors (where we know the name).
         // Top-level errors have no associated name, so no watcher to notify.
         for (resource_name, error) in &per_resource_errors {
-            self.notify_resource_error(&type_url, resource_name, error)
+            self.notify_resource_error(&type_url, resource_name, error, &done)
                 .await;
         }
 
         // Detect deleted resources (per A53):
         // For resource types with ALL_RESOURCES_REQUIRED_IN_SOTW = true,
         // any previously-received resource not in this response is deleted.
-        let deleted_futures = self
-            .detect_deleted_resources(&type_url, &received_names)
+        self.detect_deleted_resources(&type_url, &received_names, &done)
             .await;
-        processing_done_futures.extend(deleted_futures);
-
-        // Wait for all watchers to finish processing.
-        for rx in processing_done_futures {
-            let _ = rx.await;
-        }
 
         let has_errors = !top_level_errors.is_empty() || !per_resource_errors.is_empty();
         if !has_errors {
@@ -746,7 +1163,7 @@ where
             if let Some(ts) = self.type_states.get_mut(&type_url) {
                 ts.version_info = response.version_info.clone();
             }
-            self.send_ack(stream, &response).await
+            self.send_ack(sender, &response)?;
         } else {
             // Build NACK message combining both error categories
             let mut error_parts = Vec::new();
@@ -764,22 +1181,22 @@ where
                 error_parts.push(per_resource_msg);
             }
 
-            self.send_nack(stream, &response, error_parts.join("; "))
-                .await
+            self.send_nack(sender, &response, error_parts.join("; "))?;
         }
+
+        Ok(())
     }
 
-    /// Dispatch decoded resources to watchers and update cache.
+    /// Update the cache from decoded resources and notify matching watchers.
     ///
-    /// Returns futures that resolve when watchers signal ProcessingDone.
-    /// Uses backpressure: waits if a watcher's channel is full.
+    /// Delivered events share the response's `ProcessingDone` signal, which
+    /// gates reading the next response (ADS flow control).
     async fn dispatch_resources(
         &mut self,
         type_url: &str,
         resources: Vec<DecodedResource>,
-    ) -> Vec<oneshot::Receiver<()>> {
-        let mut processing_done_futures = Vec::new();
-
+        done: &ProcessingDone,
+    ) {
         let watcher_info: Vec<_> = match self.type_states.get_mut(type_url) {
             Some(s) => {
                 for resource in &resources {
@@ -789,12 +1206,14 @@ where
                         CachedResource::received(Arc::new(resource.clone())),
                     );
                 }
+                let counts = s.resource_state_counts();
+                self.recorder.sync_resource_counts(&s.type_url, &counts);
                 s.watchers
                     .iter()
                     .map(|(id, entry)| (*id, entry.event_tx.clone(), entry.subscription.clone()))
                     .collect()
             }
-            None => return processing_done_futures,
+            None => return,
         };
 
         // Cancel resource timers for received resources (gRFC A57).
@@ -807,29 +1226,29 @@ where
             let resource_name = resource.name().to_string();
             let resource = Arc::new(resource);
 
-            for (_watcher_id, event_tx, subscription) in watcher_info.clone() {
+            for (_watcher_id, event_tx, subscription) in &watcher_info {
                 if subscription.matches(&resource_name) {
-                    let (done, rx) = ProcessingDone::channel();
                     let event = ResourceEvent::ResourceChanged {
                         result: Ok(Arc::clone(&resource)),
-                        done,
+                        done: done.share(),
                     };
-                    // Use backpressure: await if channel is full.
-                    // Ignore send errors (watcher dropped).
                     let _ = event_tx.send(event).await;
-                    processing_done_futures.push(rx);
                 }
             }
         }
-
-        processing_done_futures
     }
 
-    /// Notify watchers of a validation error for a specific resource.
+    /// Send validation-error notifications for a specific resource.
     ///
     /// Per gRFC A46/A88, errors are routed only to watchers interested in
     /// that specific resource (plus wildcard watchers).
-    async fn notify_resource_error(&mut self, type_url: &str, resource_name: &str, error: &str) {
+    async fn notify_resource_error(
+        &mut self,
+        type_url: &str,
+        resource_name: &str,
+        error: &str,
+        done: &ProcessingDone,
+    ) {
         let type_state = match self.type_states.get_mut(type_url) {
             Some(s) => s,
             None => return,
@@ -839,22 +1258,25 @@ where
             resource_name.to_string(),
             CachedResource::nacked(error.to_string()),
         );
+        let counts = type_state.resource_state_counts();
+        self.recorder
+            .sync_resource_counts(&type_state.type_url, &counts);
 
         // Cancel the resource timer (gRFC A57).
         self.resource_timers
             .remove(&(type_url.to_string(), resource_name.to_string()));
 
         for event_tx in type_state.matching_watchers(resource_name) {
-            let (done, _rx) = ProcessingDone::channel();
             let event = ResourceEvent::ResourceChanged {
                 result: Err(Error::Validation(error.to_string())),
-                done,
+                done: done.share(),
             };
             let _ = event_tx.send(event).await;
         }
     }
 
-    /// Detect resources that were deleted (present in cache but not in response).
+    /// Detect resources that were deleted (present in cache but not in response)
+    /// and notify matching watchers.
     ///
     /// Per gRFC A53, for resource types with ALL_RESOURCES_REQUIRED_IN_SOTW = true,
     /// if a previously-received resource is absent from a new SotW response,
@@ -863,16 +1285,15 @@ where
         &mut self,
         type_url: &str,
         received_names: &HashSet<String>,
-    ) -> Vec<oneshot::Receiver<()>> {
-        let mut processing_done_futures = Vec::new();
-
+        done: &ProcessingDone,
+    ) {
         let type_state = match self.type_states.get_mut(type_url) {
             Some(s) => s,
-            None => return processing_done_futures,
+            None => return,
         };
 
         if !type_state.all_resources_required_in_sotw {
-            return processing_done_futures;
+            return;
         }
 
         let deleted_names: Vec<String> = type_state
@@ -890,23 +1311,24 @@ where
                 .insert(name.clone(), CachedResource::does_not_exist());
 
             for event_tx in type_state.matching_watchers(&name) {
-                let (done, rx) = ProcessingDone::channel();
                 let event = ResourceEvent::ResourceChanged {
                     result: Err(Error::ResourceDoesNotExist),
-                    done,
+                    done: done.share(),
                 };
                 let _ = event_tx.send(event).await;
-                processing_done_futures.push(rx);
             }
         }
 
-        processing_done_futures
+        // Reconcile the resources gauge once from the updated cache.
+        let counts = type_state.resource_state_counts();
+        self.recorder
+            .sync_resource_counts(&type_state.type_url, &counts);
     }
 
-    /// Send an ACK for a response.
-    async fn send_ack<S: TransportStream>(
+    /// Send an ACK for a response to the unbounded write channel.
+    fn send_ack(
         &self,
-        stream: &mut S,
+        sender: &mpsc::UnboundedSender<Bytes>,
         response: &DiscoveryResponse,
     ) -> Result<()> {
         let type_state = match self.type_states.get(&response.type_url) {
@@ -925,13 +1347,14 @@ where
         };
 
         let bytes = self.codec.encode_request(&request)?;
-        stream.send(bytes).await
+        sender.send(bytes).map_err(|_| Error::StreamClosed)?;
+        Ok(())
     }
 
-    /// Send a NACK for a response.
-    async fn send_nack<S: TransportStream>(
+    /// Send a NACK for a response to the unbounded write channel.
+    fn send_nack(
         &self,
-        stream: &mut S,
+        sender: &mpsc::UnboundedSender<Bytes>,
         response: &DiscoveryResponse,
         error_message: String,
     ) -> Result<()> {
@@ -954,7 +1377,8 @@ where
         };
 
         let bytes = self.codec.encode_request(&request)?;
-        stream.send(bytes).await
+        sender.send(bytes).map_err(|_| Error::StreamClosed)?;
+        Ok(())
     }
 
     /// Start a timer for a resource in Requested state (gRFC A57).
@@ -980,10 +1404,12 @@ where
         self.runtime.spawn(async move {
             tokio::select! {
                 _ = runtime.sleep(timeout) => {
-                    let _ = command_tx.send(WorkerCommand::ResourceTimerExpired {
-                        type_url: type_url_owned,
-                        name,
-                    }).await;
+                    if let Some(command_tx) = command_tx.upgrade() {
+                        let _ = command_tx.send(WorkerCommand::ResourceTimerExpired {
+                            type_url: type_url_owned,
+                            name,
+                        }).await;
+                    }
                 }
                 _ = cancel_rx => {}
             }
@@ -1018,14 +1444,951 @@ where
         type_state
             .cache
             .insert(name.to_string(), CachedResource::does_not_exist());
+        let counts = type_state.resource_state_counts();
+        self.recorder
+            .sync_resource_counts(&type_state.type_url, &counts);
 
         for event_tx in type_state.matching_watchers(name) {
-            let (done, _rx) = ProcessingDone::channel();
             let event = ResourceEvent::ResourceChanged {
                 result: Err(Error::ResourceDoesNotExist),
-                done,
+                done: ProcessingDone::detached(),
             };
             let _ = event_tx.send(event).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use bytes::Bytes;
+
+    use super::*;
+    use crate::client::config::{ClientConfig, ServerConfig};
+    use crate::client::watch::{ResourceEvent, ResourceWatcher};
+    use crate::codec::XdsCodec;
+    use crate::error::Result;
+    use crate::message::{DiscoveryRequest, DiscoveryResponse, Node, ResourceAny};
+    use crate::resource::{Resource, TypeUrl};
+    use crate::runtime::tokio::TokioRuntime;
+    use crate::transport::TransportBuilder;
+    use crate::transport::mock::{MockServer, MockTransport, mock_transport};
+    use crate::{Error, XdsClient};
+
+    /// Captures every measurement so tests can assert on the call sequence.
+    #[derive(Default)]
+    struct CapturingRecorder {
+        events: Mutex<Vec<Recorded>>,
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct Recorded {
+        instrument: &'static str,
+        kind: Measurement,
+        attrs: Vec<(&'static str, String)>,
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum Measurement {
+        CounterU64(u64),
+        UpDownI64(i64),
+        Gauge(i64),
+    }
+
+    impl CapturingRecorder {
+        fn take(&self) -> Vec<Recorded> {
+            std::mem::take(&mut *self.events.lock().unwrap())
+        }
+    }
+
+    fn stringify(attrs: &[KeyValue]) -> Vec<(&'static str, String)> {
+        attrs
+            .iter()
+            .map(|kv| {
+                let v = match &kv.value {
+                    metrics::Value::Bool(b) => b.to_string(),
+                    metrics::Value::Int(i) => i.to_string(),
+                    metrics::Value::F64(f) => f.to_string(),
+                    metrics::Value::Str(s) => s.to_string(),
+                };
+                (kv.key, v)
+            })
+            .collect()
+    }
+
+    impl MetricsRecorder for CapturingRecorder {
+        fn add_counter_u64(
+            &self,
+            instrument: &'static metrics::Instrument,
+            value: u64,
+            attrs: &[KeyValue],
+        ) {
+            self.events.lock().unwrap().push(Recorded {
+                instrument: instrument.name,
+                kind: Measurement::CounterU64(value),
+                attrs: stringify(attrs),
+            });
+        }
+
+        fn add_up_down_counter_i64(
+            &self,
+            instrument: &'static metrics::Instrument,
+            value: i64,
+            attrs: &[KeyValue],
+        ) {
+            self.events.lock().unwrap().push(Recorded {
+                instrument: instrument.name,
+                kind: Measurement::UpDownI64(value),
+                attrs: stringify(attrs),
+            });
+        }
+
+        fn record_histogram_f64(&self, _: &'static metrics::Instrument, _: f64, _: &[KeyValue]) {
+            unreachable!("worker emits no histograms");
+        }
+
+        fn record_gauge_i64(
+            &self,
+            instrument: &'static metrics::Instrument,
+            value: i64,
+            attrs: &[KeyValue],
+        ) {
+            self.events.lock().unwrap().push(Recorded {
+                instrument: instrument.name,
+                kind: Measurement::Gauge(value),
+                attrs: stringify(attrs),
+            });
+        }
+    }
+
+    fn attr<'a>(rec: &'a Recorded, key: &str) -> Option<&'a str> {
+        rec.attrs
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// Build a [`RecorderHandle`] backed by a [`CapturingRecorder`], wired
+    /// with the canonical test attributes used by the transition tests.
+    fn test_handle() -> (Arc<CapturingRecorder>, RecorderHandle) {
+        let recorder = Arc::new(CapturingRecorder::default());
+        let dyn_recorder: Arc<dyn MetricsRecorder> = recorder.clone();
+        let mut handle = RecorderHandle::new(Some(dyn_recorder), Arc::from("xds:///my-service"));
+        handle.set_server(Arc::from("xds.example.com:443"));
+        (recorder, handle)
+    }
+
+    fn test_type_url() -> Arc<str> {
+        Arc::from("envoy.config.listener.v3.Listener")
+    }
+
+    /// Value of the `resources` gauge emitted for a given `cache_state`, if any.
+    fn gauge_for(events: &[Recorded], cache_state: &str) -> Option<i64> {
+        events.iter().find_map(|e| {
+            if attr(e, "grpc.xds.cache_state") == Some(cache_state) {
+                match e.kind {
+                    Measurement::Gauge(v) => Some(v),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        })
+    }
+
+    #[test]
+    fn first_sync_emits_each_bucket_with_attrs() {
+        let (recorder, mut handle) = test_handle();
+        let type_url = test_type_url();
+        let counts: HashMap<&'static str, i64> = HashMap::from([("acked", 2), ("requested", 1)]);
+        handle.sync_resource_counts(&type_url, &counts);
+
+        let events = recorder.take();
+        assert_eq!(events.len(), 2);
+        assert_eq!(gauge_for(&events, "acked"), Some(2));
+        assert_eq!(gauge_for(&events, "requested"), Some(1));
+
+        let acked = events
+            .iter()
+            .find(|e| attr(e, "grpc.xds.cache_state") == Some("acked"))
+            .expect("acked bucket emitted");
+        assert_eq!(acked.instrument, "grpc.xds_client.resources");
+        assert_eq!(
+            attr(acked, "grpc.xds.resource_type"),
+            Some("envoy.config.listener.v3.Listener")
+        );
+        assert_eq!(attr(acked, "grpc.target"), Some("xds:///my-service"));
+        assert_eq!(attr(acked, "grpc.xds.authority"), Some("#old"));
+        assert_eq!(attr(acked, "grpc.xds.server"), None);
+    }
+
+    #[test]
+    fn unchanged_sync_is_idempotent() {
+        let (recorder, mut handle) = test_handle();
+        let type_url = test_type_url();
+        let counts: HashMap<&'static str, i64> = HashMap::from([("acked", 2)]);
+        handle.sync_resource_counts(&type_url, &counts);
+        let _ = recorder.take();
+
+        handle.sync_resource_counts(&type_url, &counts);
+        assert!(recorder.take().is_empty());
+    }
+
+    #[test]
+    fn sync_emits_only_changed_buckets() {
+        let (recorder, mut handle) = test_handle();
+        let type_url = test_type_url();
+        handle.sync_resource_counts(&type_url, &HashMap::from([("acked", 2)]));
+        let _ = recorder.take();
+
+        // `acked` drops to 1 and a new `nacked` bucket appears.
+        handle.sync_resource_counts(&type_url, &HashMap::from([("acked", 1), ("nacked", 1)]));
+
+        let events = recorder.take();
+        assert_eq!(events.len(), 2);
+        assert_eq!(gauge_for(&events, "acked"), Some(1));
+        assert_eq!(gauge_for(&events, "nacked"), Some(1));
+    }
+
+    #[test]
+    fn emptied_bucket_is_reset_to_zero() {
+        let (recorder, mut handle) = test_handle();
+        let type_url = test_type_url();
+        handle.sync_resource_counts(&type_url, &HashMap::from([("acked", 1)]));
+        let _ = recorder.take();
+
+        // The whole type empties (e.g. all resources removed).
+        handle.sync_resource_counts(&type_url, &HashMap::new());
+
+        let events = recorder.take();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].instrument, "grpc.xds_client.resources");
+        assert_eq!(gauge_for(&events, "acked"), Some(0));
+    }
+
+    const TEST_TYPE_URL: &str = "type.googleapis.com/test.Resource";
+    const SOTW_TYPE_URL: &str = "type.googleapis.com/test.SotwResource";
+
+    /// Minimal resource: the message is the resource name itself. Names
+    /// starting with `bad` fail validation (a per-resource error, per A46).
+    #[derive(Debug, Clone)]
+    struct TestResource;
+
+    impl Resource for TestResource {
+        type Message = String;
+        const TYPE_URL: TypeUrl = TypeUrl::new(TEST_TYPE_URL);
+        const ALL_RESOURCES_REQUIRED_IN_SOTW: bool = false;
+
+        fn deserialize(bytes: Bytes) -> Result<Self::Message> {
+            String::from_utf8(bytes.to_vec()).map_err(|e| Error::Validation(e.to_string()))
+        }
+
+        fn name(message: &Self::Message) -> &str {
+            message
+        }
+
+        fn validate(message: Self::Message) -> Result<Self> {
+            if message.starts_with("bad") {
+                return Err(Error::Validation("bad resource".to_string()));
+            }
+            Ok(Self)
+        }
+    }
+
+    /// Like [`TestResource`] but with `ALL_RESOURCES_REQUIRED_IN_SOTW`, so
+    /// resources missing from a response are treated as deleted (gRFC A53).
+    #[derive(Debug, Clone)]
+    struct SotwResource;
+
+    impl Resource for SotwResource {
+        type Message = String;
+        const TYPE_URL: TypeUrl = TypeUrl::new(SOTW_TYPE_URL);
+        const ALL_RESOURCES_REQUIRED_IN_SOTW: bool = true;
+
+        fn deserialize(bytes: Bytes) -> Result<Self::Message> {
+            String::from_utf8(bytes.to_vec()).map_err(|e| Error::Validation(e.to_string()))
+        }
+
+        fn name(message: &Self::Message) -> &str {
+            message
+        }
+
+        fn validate(_message: Self::Message) -> Result<Self> {
+            Ok(Self)
+        }
+    }
+
+    /// Line-based codec: `type_url \n version \n nonce \n name,name,...`.
+    struct FakeCodec;
+
+    impl XdsCodec for FakeCodec {
+        fn encode_request(&self, request: &DiscoveryRequest<'_>) -> Result<Bytes> {
+            Ok(Bytes::from(format!(
+                "{}\n{}\n{}\n{}",
+                request.type_url,
+                request.version_info,
+                request.response_nonce,
+                request.resource_names.join(",")
+            )))
+        }
+
+        fn decode_response(&self, bytes: Bytes) -> Result<DiscoveryResponse> {
+            let text =
+                String::from_utf8(bytes.to_vec()).map_err(|e| Error::Validation(e.to_string()))?;
+            let mut lines = text.split('\n');
+            let type_url = lines.next().unwrap_or_default().to_string();
+            let version_info = lines.next().unwrap_or_default().to_string();
+            let nonce = lines.next().unwrap_or_default().to_string();
+            let resources = lines
+                .next()
+                .unwrap_or_default()
+                .split(',')
+                .filter(|n| !n.is_empty())
+                .map(|name| ResourceAny {
+                    type_url: type_url.clone(),
+                    value: Bytes::from(name.to_string()),
+                })
+                .collect();
+            Ok(DiscoveryResponse {
+                version_info,
+                resources,
+                type_url,
+                nonce,
+            })
+        }
+    }
+
+    fn response_for(type_url: &str, version: &str, nonce: &str, names: &[&str]) -> Bytes {
+        Bytes::from(format!(
+            "{type_url}\n{version}\n{nonce}\n{}",
+            names.join(",")
+        ))
+    }
+
+    fn response(version: &str, nonce: &str, names: &[&str]) -> Bytes {
+        response_for(TEST_TYPE_URL, version, nonce, names)
+    }
+
+    fn sotw_response(version: &str, nonce: &str, names: &[&str]) -> Bytes {
+        response_for(SOTW_TYPE_URL, version, nonce, names)
+    }
+
+    /// (version_info, response_nonce) of an encoded request.
+    fn parse_request(bytes: &Bytes) -> (String, String) {
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        let mut lines = text.split('\n');
+        let _type_url = lines.next().unwrap_or_default();
+        let version = lines.next().unwrap_or_default().to_string();
+        let nonce = lines.next().unwrap_or_default().to_string();
+        (version, nonce)
+    }
+
+    /// Client watching `res-0` (of resource type `T`) with an established
+    /// mock stream, its initial request already drained.
+    async fn connected_client_for<T: Resource>() -> (XdsClient, ResourceWatcher<T>, MockServer) {
+        let (builder, mut servers) = mock_transport();
+        let config = ClientConfig::new(Node::new("test", "0"), "mock:///xds");
+        let client = XdsClient::builder(config, builder, FakeCodec, TokioRuntime).build();
+
+        let watcher = client.watch::<T>("res-0").await;
+        let mut server = tokio::time::timeout(Duration::from_secs(5), servers.recv())
+            .await
+            .expect("timed out waiting for stream")
+            .expect("transport dropped");
+        let _initial = tokio::time::timeout(Duration::from_secs(5), server.requests.recv())
+            .await
+            .expect("timed out waiting for initial request")
+            .expect("stream closed");
+        (client, watcher, server)
+    }
+
+    async fn connected_client() -> (XdsClient, ResourceWatcher<TestResource>, MockServer) {
+        connected_client_for::<TestResource>().await
+    }
+
+    /// Watch `name` and wait for the resulting subscription request, so the
+    /// watcher is registered before the test sends a response.
+    async fn watch_synced(
+        client: &XdsClient,
+        server: &mut MockServer,
+        name: &str,
+    ) -> ResourceWatcher<TestResource> {
+        let watcher = client.watch::<TestResource>(name).await;
+        let _request = tokio::time::timeout(Duration::from_secs(5), server.requests.recv())
+            .await
+            .expect("timed out waiting for subscription request")
+            .expect("stream closed");
+        watcher
+    }
+
+    /// Next event, unwrapped to its result and `ProcessingDone` token.
+    async fn next_changed<T: Resource>(
+        watcher: &mut ResourceWatcher<T>,
+    ) -> (
+        Result<std::sync::Arc<T>>,
+        crate::client::watch::ProcessingDone,
+    ) {
+        let event = tokio::time::timeout(Duration::from_secs(5), watcher.next())
+            .await
+            .expect("timed out waiting for event")
+            .expect("watcher closed");
+        match event {
+            ResourceEvent::ResourceChanged { result, done } => (result, done),
+            ResourceEvent::AmbientError { .. } => panic!("unexpected ambient error"),
+        }
+    }
+
+    /// Asserts no event is delivered to `watcher` within a short window.
+    async fn assert_no_event<T: Resource>(watcher: &mut ResourceWatcher<T>, message: &str) {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), watcher.next())
+                .await
+                .is_err(),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn connected_metric_lifecycle() {
+        let recorder = Arc::new(CapturingRecorder::default());
+        let (builder, mut servers) = mock_transport();
+        let config = ClientConfig::new(Node::new("test", "0"), "mock:///xds");
+        let client = XdsClient::builder(config, builder, FakeCodec, TokioRuntime)
+            .with_metrics_recorder(recorder.clone())
+            .build();
+
+        // Initial state: connected = 1 is recorded for the server URI
+        let mut watcher = client.watch::<TestResource>("res-0").await;
+        let mut server1 = tokio::time::timeout(Duration::from_secs(5), servers.recv())
+            .await
+            .expect("timed out waiting for stream 1")
+            .expect("transport dropped");
+        let _ = tokio::time::timeout(Duration::from_secs(5), server1.requests.recv())
+            .await
+            .expect("timed out waiting for initial request")
+            .expect("stream closed");
+
+        let events = recorder.take();
+        let connected = events
+            .iter()
+            .find(|e| e.instrument == "grpc.xds_client.connected");
+        assert_eq!(connected.map(|e| &e.kind), Some(&Measurement::Gauge(1)));
+        assert_eq!(
+            attr(connected.unwrap(), "grpc.xds.server"),
+            Some("mock:///xds")
+        );
+
+        // Stream closes without seeing a response: transitions to connected = 0 and increments
+        // server_failure
+        server1.responses.send(Ok(None)).unwrap();
+
+        // Wait for worker to reconnect with stream 2
+        let mut server2 = tokio::time::timeout(Duration::from_secs(5), servers.recv())
+            .await
+            .expect("timed out waiting for stream 2")
+            .expect("transport dropped");
+        let _ = tokio::time::timeout(Duration::from_secs(5), server2.requests.recv())
+            .await
+            .expect("timed out waiting for request on stream 2")
+            .expect("stream closed");
+
+        let events = recorder.take();
+        assert_eq!(
+            events
+                .iter()
+                .find(|e| e.instrument == "grpc.xds_client.connected")
+                .map(|e| &e.kind),
+            Some(&Measurement::Gauge(0))
+        );
+        assert_eq!(
+            events
+                .iter()
+                .find(|e| e.instrument == "grpc.xds_client.server_failure")
+                .map(|e| &e.kind),
+            Some(&Measurement::CounterU64(1))
+        );
+
+        // First response arrives on reconnected stream: resets connected = 1
+        server2
+            .responses
+            .send(Ok(Some(response("1", "n1", &["res-0"]))))
+            .unwrap();
+        let (result, done) = next_changed(&mut watcher).await;
+        assert!(result.is_ok());
+        drop(done);
+
+        let events = recorder.take();
+        assert_eq!(
+            events
+                .iter()
+                .find(|e| e.instrument == "grpc.xds_client.connected")
+                .map(|e| &e.kind),
+            Some(&Measurement::Gauge(1))
+        );
+
+        // Stream closes after seeing a response: does NOT count as server failure
+        server2.responses.send(Ok(None)).unwrap();
+
+        let mut server3 = tokio::time::timeout(Duration::from_secs(5), servers.recv())
+            .await
+            .expect("timed out waiting for stream 3")
+            .expect("transport dropped");
+        let _ = tokio::time::timeout(Duration::from_secs(5), server3.requests.recv())
+            .await
+            .expect("timed out waiting for request on stream 3")
+            .expect("stream closed");
+
+        let events = recorder.take();
+        assert!(!events.iter().any(|e| {
+            e.instrument == "grpc.xds_client.connected"
+                || e.instrument == "grpc.xds_client.server_failure"
+        }));
+
+        // Worker shuts down when client is dropped: connected resets to 0
+        drop(client);
+        drop(watcher);
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), servers.recv())
+                .await
+                .expect("timed out waiting for worker shutdown")
+                .is_none()
+        );
+
+        let events = recorder.take();
+        assert!(events.iter().any(
+            |e| e.instrument == "grpc.xds_client.connected" && e.kind == Measurement::Gauge(0)
+        ));
+    }
+
+    struct FailingTransportBuilder {
+        attempt_tx: Mutex<Option<oneshot::Sender<()>>>,
+    }
+
+    impl TransportBuilder for FailingTransportBuilder {
+        type Transport = MockTransport;
+
+        async fn build(&self, _server: &ServerConfig) -> Result<Self::Transport> {
+            let _ = self.attempt_tx.lock().unwrap().take();
+            Err(Error::StreamClosed)
+        }
+    }
+
+    #[tokio::test]
+    async fn initial_connection_failure_records_server_failure() {
+        let (attempt_tx, attempt_rx) = oneshot::channel();
+        let builder = FailingTransportBuilder {
+            attempt_tx: Mutex::new(Some(attempt_tx)),
+        };
+        let recorder = Arc::new(CapturingRecorder::default());
+
+        let config = ClientConfig::new(Node::new("test", "0"), "mock:///xds");
+        let client = XdsClient::builder(config, builder, FakeCodec, TokioRuntime)
+            .with_metrics_recorder(recorder.clone())
+            .build();
+
+        let _watcher = client.watch::<TestResource>("res-0").await;
+
+        tokio::time::timeout(Duration::from_secs(5), attempt_rx)
+            .await
+            .expect("timed out waiting for initial connection failure")
+            .unwrap_err();
+
+        let events = recorder.take();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.instrument == "grpc.xds_client.server_failure")
+        );
+        assert!(events.iter().any(
+            |e| e.instrument == "grpc.xds_client.connected" && e.kind == Measurement::Gauge(0)
+        ));
+    }
+
+    /// A watcher that issues more commands than the command channel buffers
+    /// while holding its `ProcessingDone` token must not deadlock the worker.
+    ///
+    /// Before the flow-control fix the worker awaited the token inside
+    /// `handle_response`, so it stopped draining commands; once the channel
+    /// filled, watcher and worker waited on each other forever.
+    #[tokio::test]
+    async fn commands_drain_while_processing_done_is_held() {
+        let (client, mut watcher, server) = connected_client().await;
+
+        server
+            .responses
+            .send(Ok(Some(response("1", "n1", &["res-0"]))))
+            .unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(5), watcher.next())
+            .await
+            .expect("timed out waiting for event")
+            .expect("watcher closed");
+        let ResourceEvent::ResourceChanged {
+            result: Ok(_),
+            done,
+        } = event
+        else {
+            panic!("expected ResourceChanged(Ok)");
+        };
+
+        // Well past COMMAND_CHANNEL_BUFFER_SIZE (64).
+        let mut extra = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for i in 1..=100 {
+                extra.push(client.watch::<TestResource>(format!("res-{i}")).await);
+            }
+        })
+        .await
+        .expect("deadlock: commands not drained while ProcessingDone was held");
+
+        // The worker is still healthy end-to-end: it reads the next response
+        // and delivers it.
+        drop(done);
+        server
+            .responses
+            .send(Ok(Some(response("2", "n2", &["res-0"]))))
+            .unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(5), watcher.next())
+            .await
+            .expect("timed out waiting for second event")
+            .expect("watcher closed");
+        assert!(matches!(
+            event,
+            ResourceEvent::ResourceChanged { result: Ok(_), .. }
+        ));
+    }
+
+    /// The ACK goes out as soon as the response is validated and cached, and
+    /// the *next* response is not delivered until the previous one's
+    /// `ProcessingDone` tokens drop (ADS flow control).
+    #[tokio::test]
+    async fn next_response_gated_until_processing_done() {
+        let (_client, mut watcher, mut server) = connected_client().await;
+
+        server
+            .responses
+            .send(Ok(Some(response("1", "n1", &["res-0"]))))
+            .unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(5), watcher.next())
+            .await
+            .expect("timed out waiting for event")
+            .expect("watcher closed");
+        let ResourceEvent::ResourceChanged {
+            result: Ok(_),
+            done,
+        } = event
+        else {
+            panic!("expected ResourceChanged(Ok)");
+        };
+
+        // ACK is not gated on ProcessingDone.
+        let ack = tokio::time::timeout(Duration::from_secs(5), server.requests.recv())
+            .await
+            .expect("ACK not sent while ProcessingDone was held")
+            .expect("stream closed");
+        assert_eq!(parse_request(&ack), ("1".to_string(), "n1".to_string()));
+
+        // The next response is gated on ProcessingDone.
+        server
+            .responses
+            .send(Ok(Some(response("2", "n2", &["res-0"]))))
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), watcher.next())
+                .await
+                .is_err(),
+            "second response delivered while the first was still being processed"
+        );
+
+        drop(done);
+        let event = tokio::time::timeout(Duration::from_secs(5), watcher.next())
+            .await
+            .expect("timed out waiting for second event")
+            .expect("watcher closed");
+        assert!(matches!(
+            event,
+            ResourceEvent::ResourceChanged { result: Ok(_), .. }
+        ));
+        let ack = tokio::time::timeout(Duration::from_secs(5), server.requests.recv())
+            .await
+            .expect("second ACK not sent")
+            .expect("stream closed");
+        assert_eq!(parse_request(&ack), ("2".to_string(), "n2".to_string()));
+    }
+
+    /// The next response is gated until *every* watcher drops its
+    /// `ProcessingDone` token, not just the first one.
+    #[tokio::test]
+    async fn next_response_gated_until_all_watchers_signal() {
+        let (client, mut w1, mut server) = connected_client().await;
+        let mut w2 = watch_synced(&client, &mut server, "res-1").await;
+
+        server
+            .responses
+            .send(Ok(Some(response("1", "n1", &["res-0", "res-1"]))))
+            .unwrap();
+        let (r1, done1) = next_changed(&mut w1).await;
+        let (r2, done2) = next_changed(&mut w2).await;
+        assert!(r1.is_ok() && r2.is_ok());
+
+        drop(done1);
+        server
+            .responses
+            .send(Ok(Some(response("2", "n2", &["res-0", "res-1"]))))
+            .unwrap();
+        assert_no_event(&mut w1, "second response delivered while a token was held").await;
+
+        drop(done2);
+        assert!(next_changed(&mut w1).await.0.is_ok());
+        assert!(next_changed(&mut w2).await.0.is_ok());
+    }
+
+    /// Validation-error events gate flow control like regular updates:
+    /// the response is NACKed, valid resources are still delivered, and
+    /// holding the error token delays the next response.
+    #[tokio::test]
+    async fn error_events_gate_next_response() {
+        let (client, mut w_ok, mut server) = connected_client().await;
+        let mut w_bad = watch_synced(&client, &mut server, "bad-0").await;
+
+        server
+            .responses
+            .send(Ok(Some(response("1", "n1", &["res-0", "bad-0"]))))
+            .unwrap();
+        let (result, done_ok) = next_changed(&mut w_ok).await;
+        assert!(result.is_ok());
+        let (result, err_done) = next_changed(&mut w_bad).await;
+        assert!(matches!(result, Err(Error::Validation(_))));
+
+        // NACK keeps the old (empty) version.
+        let nack = tokio::time::timeout(Duration::from_secs(5), server.requests.recv())
+            .await
+            .expect("NACK not sent")
+            .expect("stream closed");
+        assert_eq!(parse_request(&nack), ("".to_string(), "n1".to_string()));
+
+        drop(done_ok);
+        server
+            .responses
+            .send(Ok(Some(response("2", "n2", &["res-0"]))))
+            .unwrap();
+        assert_no_event(
+            &mut w_ok,
+            "response delivered while the error token was held",
+        )
+        .await;
+
+        drop(err_done);
+        assert!(next_changed(&mut w_ok).await.0.is_ok());
+    }
+
+    /// Deletion events (SotW resource missing from a response, gRFC A53)
+    /// gate the next response like regular updates.
+    #[tokio::test]
+    async fn deletion_events_gate_next_response() {
+        let (_client, mut watcher, server) = connected_client_for::<SotwResource>().await;
+
+        server
+            .responses
+            .send(Ok(Some(sotw_response("1", "n1", &["res-0"]))))
+            .unwrap();
+        let (result, done) = next_changed(&mut watcher).await;
+        assert!(result.is_ok());
+        drop(done);
+
+        // res-0 missing from the SotW response: deleted.
+        server
+            .responses
+            .send(Ok(Some(sotw_response("2", "n2", &[]))))
+            .unwrap();
+        let (result, deletion_done) = next_changed(&mut watcher).await;
+        assert!(matches!(result, Err(Error::ResourceDoesNotExist)));
+
+        server
+            .responses
+            .send(Ok(Some(sotw_response("3", "n3", &["res-0"]))))
+            .unwrap();
+        assert_no_event(
+            &mut watcher,
+            "response delivered while the deletion token was held",
+        )
+        .await;
+
+        drop(deletion_done);
+        assert!(next_changed(&mut watcher).await.0.is_ok());
+    }
+
+    /// Events staged for a watcher that was dropped must not wedge flow
+    /// control: their failed sends release the shared signal.
+    #[tokio::test]
+    async fn dropped_watcher_does_not_stall_flow_control() {
+        let (client, mut w1, mut server) = connected_client().await;
+        drop(watch_synced(&client, &mut server, "res-1").await);
+
+        server
+            .responses
+            .send(Ok(Some(response("1", "n1", &["res-0", "res-1"]))))
+            .unwrap();
+        let (result, done) = next_changed(&mut w1).await;
+        assert!(result.is_ok());
+        drop(done);
+
+        server
+            .responses
+            .send(Ok(Some(response("2", "n2", &["res-0", "res-1"]))))
+            .unwrap();
+        assert!(next_changed(&mut w1).await.0.is_ok());
+    }
+
+    /// A wildcard watcher receiving a response with more resources than
+    /// `WATCHER_CHANNEL_BUFFER_SIZE` (16) must not deadlock the worker even
+    /// before the watcher reads any events, and ADS flow control must remain
+    /// gated until all delivered tokens are dropped.
+    #[tokio::test]
+    async fn wildcard_watcher_many_resources_does_not_deadlock() {
+        let (builder, mut servers) = mock_transport();
+        let config = ClientConfig::new(Node::new("test", "0"), "mock:///xds");
+        let client = XdsClient::builder(config, builder, FakeCodec, TokioRuntime).build();
+
+        let mut watcher = client.watch::<TestResource>("").await;
+        let mut server = tokio::time::timeout(Duration::from_secs(5), servers.recv())
+            .await
+            .expect("timed out waiting for stream")
+            .expect("transport dropped");
+        let _initial = tokio::time::timeout(Duration::from_secs(5), server.requests.recv())
+            .await
+            .expect("timed out waiting for initial request")
+            .expect("stream closed");
+
+        let names: Vec<String> = (0..50).map(|i| format!("res-{i}")).collect();
+        let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+        server
+            .responses
+            .send(Ok(Some(response("1", "n1", &name_refs))))
+            .unwrap();
+
+        // Wait for ACK to confirm worker processed the response.
+        let ack = tokio::time::timeout(Duration::from_secs(5), server.requests.recv())
+            .await
+            .expect("ACK not sent")
+            .expect("stream closed");
+        assert_eq!(parse_request(&ack), ("1".to_string(), "n1".to_string()));
+
+        // Worker is not deadlocked even though 50 events were produced and none
+        // have been read from `watcher` yet: issuing a command succeeds.
+        let mut extra = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.watch::<TestResource>("extra"),
+        )
+        .await
+        .expect("worker deadlocked on full wildcard channel");
+
+        let mut dones = Vec::new();
+        for _ in 0..50 {
+            let (res, done) = next_changed(&mut watcher).await;
+            assert!(res.is_ok());
+            dones.push(done);
+        }
+
+        // Send a second response for `extra`. It should be gated until all 50 tokens drop.
+        server
+            .responses
+            .send(Ok(Some(response("2", "n2", &["extra"]))))
+            .unwrap();
+        assert_no_event(
+            &mut extra,
+            "second response delivered before all tokens dropped",
+        )
+        .await;
+
+        drop(dones);
+        assert!(next_changed(&mut extra).await.0.is_ok());
+    }
+
+    /// When the stream closes, the worker reconnects with a new stream and
+    /// re-subscribes active watchers.
+    #[tokio::test]
+    async fn stream_closed_triggers_reconnect() {
+        let (builder, mut servers) = mock_transport();
+        let config = ClientConfig::new(Node::new("test", "0"), "mock:///xds");
+        let client = XdsClient::builder(config, builder, FakeCodec, TokioRuntime).build();
+
+        let mut watcher = client.watch::<TestResource>("res-0").await;
+        let mut server1 = tokio::time::timeout(Duration::from_secs(5), servers.recv())
+            .await
+            .expect("timed out waiting for stream")
+            .expect("transport dropped");
+        let _initial1 = tokio::time::timeout(Duration::from_secs(5), server1.requests.recv())
+            .await
+            .expect("timed out waiting for initial request")
+            .expect("stream closed");
+
+        // Close the first stream.
+        server1.responses.send(Ok(None)).unwrap();
+
+        // Worker should reconnect on a new stream.
+        let mut server2 = tokio::time::timeout(Duration::from_secs(5), servers.recv())
+            .await
+            .expect("timed out waiting for reconnected stream")
+            .expect("transport dropped");
+
+        // Reconnected stream should send initial requests for active watchers.
+        let initial2 = tokio::time::timeout(Duration::from_secs(5), server2.requests.recv())
+            .await
+            .expect("timed out waiting for initial request on new stream")
+            .expect("stream closed");
+        let (version, _nonce) = parse_request(&initial2);
+        assert_eq!(version, "");
+
+        // Sending a response on the new stream delivers to the watcher.
+        server2
+            .responses
+            .send(Ok(Some(response("1", "n1", &["res-0"]))))
+            .unwrap();
+        let (result, _done) = next_changed(&mut watcher).await;
+        assert!(result.is_ok());
+    }
+
+    /// Multiple watcher commands can be enqueued and sent over the unbounded
+    /// write channel even while flow control is gating the next response.
+    #[tokio::test]
+    async fn unbounded_writes_sent_while_flow_control_is_held() {
+        let (client, mut w0, mut server) = connected_client().await;
+
+        server
+            .responses
+            .send(Ok(Some(response("1", "n1", &["res-0"]))))
+            .unwrap();
+        let (_result, done) = next_changed(&mut w0).await;
+
+        // Drain ACK for res-0.
+        let ack = tokio::time::timeout(Duration::from_secs(5), server.requests.recv())
+            .await
+            .expect("ACK not sent")
+            .expect("stream closed");
+        assert_eq!(parse_request(&ack), ("1".to_string(), "n1".to_string()));
+
+        // While `done` is held, add two more watches.
+        let _w1 = client.watch::<TestResource>("res-1").await;
+        let _w2 = client.watch::<TestResource>("res-2").await;
+
+        // Both requests should arrive on the stream in order.
+        let req1 = tokio::time::timeout(Duration::from_secs(5), server.requests.recv())
+            .await
+            .expect("req1 timed out")
+            .expect("stream closed");
+        let text1 = String::from_utf8(req1.to_vec()).unwrap();
+        assert!(text1.contains("res-1"));
+
+        let req2 = tokio::time::timeout(Duration::from_secs(5), server.requests.recv())
+            .await
+            .expect("req2 timed out")
+            .expect("stream closed");
+        let text2 = String::from_utf8(req2.to_vec()).unwrap();
+        assert!(text2.contains("res-2"));
+
+        drop(done);
     }
 }

@@ -1,3 +1,27 @@
+/*
+ *
+ * Copyright 2025 gRPC authors.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
+ */
+
 //! Validated Cluster resource (CDS).
 
 use bytes::Bytes;
@@ -5,6 +29,8 @@ use envoy_types::pb::envoy::config::cluster::v3::{Cluster, cluster};
 use prost::Message;
 use xds_client::resource::TypeUrl;
 use xds_client::{Error, Resource};
+
+use super::security::{ClusterSecurityConfig, parse_transport_socket};
 
 /// Validated Cluster resource.
 #[derive(Debug, Clone)]
@@ -15,6 +41,9 @@ pub(crate) struct ClusterResource {
     pub eds_service_name: Option<String>,
     /// The load balancing policy for this cluster.
     pub lb_policy: LbPolicy,
+    /// TLS security config parsed from `transport_socket`. `None` means the
+    /// cluster uses plaintext connections.
+    pub security: Option<ClusterSecurityConfig>,
 }
 
 /// Load balancing policies.
@@ -61,10 +90,13 @@ impl Resource for ClusterResource {
             }
         };
 
+        let security = parse_transport_socket(message.transport_socket)?;
+
         Ok(ClusterResource {
             name,
             eds_service_name,
             lb_policy,
+            security,
         })
     }
 }
@@ -79,8 +111,9 @@ impl ClusterResource {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use envoy_types::pb::envoy::config::cluster::v3::cluster::EdsClusterConfig;
+
+    use super::*;
 
     fn make_cluster(name: &str) -> Cluster {
         Cluster {
@@ -152,11 +185,6 @@ mod tests {
         let cluster = make_cluster("");
         let err = ClusterResource::validate(cluster).unwrap_err();
         assert!(err.to_string().contains("cluster name is empty"));
-    }
-
-    #[test]
-    fn test_all_resources_required() {
-        assert!(ClusterResource::ALL_RESOURCES_REQUIRED_IN_SOTW);
     }
 
     #[test]

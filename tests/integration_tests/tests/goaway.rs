@@ -1,7 +1,9 @@
 use bytes::{BufMut, Bytes, BytesMut};
 use h2::server;
 use http::HeaderMap;
-use integration_tests::pb::{Input, test_client::TestClient};
+use integration_tests::pb::{
+    client_stream_client::ClientStreamClient, test_client::TestClient, Input,
+};
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tonic::transport::Endpoint;
@@ -39,10 +41,7 @@ async fn handle_grpc(
     // Trailers with grpc-status: 0 (OK) and received byte count.
     let mut trailers = HeaderMap::new();
     trailers.insert("grpc-status", "0".parse().unwrap());
-    trailers.insert(
-        "x-received-bytes",
-        total_bytes.to_string().parse().unwrap(),
-    );
+    trailers.insert("x-received-bytes", total_bytes.to_string().parse().unwrap());
     send.send_trailers(trailers).unwrap();
 }
 
@@ -238,7 +237,8 @@ async fn goaway_retries_client_streaming() {
         .connect()
         .await
         .unwrap();
-    let client = TestClient::new(channel);
+    let client = TestClient::new(channel.clone());
+    let stream_client = ClientStreamClient::new(channel);
 
     // Warm up: establish the connection with one successful request.
     let mut c = client.clone();
@@ -251,7 +251,7 @@ async fn goaway_retries_client_streaming() {
     let num_messages: usize = 10;
     let futs: Vec<_> = (0..50)
         .map(|_| {
-            let mut c = client.clone();
+            let mut c = stream_client.clone();
             tokio::spawn(async move {
                 let messages = vec![Input {}; num_messages];
                 let stream = tokio_stream::iter(messages);

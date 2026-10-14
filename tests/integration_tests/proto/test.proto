@@ -4,6 +4,11 @@ package test;
 
 service Test {
   rpc UnaryCall(Input) returns (Output);
+}
+
+// Only used by the GOAWAY tests, which run against a raw h2 server. Kept
+// separate from `Test` so the servers other tests implement are unchanged.
+service ClientStream {
   rpc ClientStreamCall(stream Input) returns (Output);
 }
 

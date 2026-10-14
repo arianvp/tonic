@@ -120,6 +120,10 @@ async fn goaway_reconnects_sequential() {
 ///
 /// This reproduces the real-world scenario (e.g. nginx keepalive_requests)
 /// where the client has more pending requests than the server will accept.
+///
+/// The rejected requests are all retried at once on a new connection that
+/// also allows only 2 streams, so they must wait for its SETTINGS instead of
+/// being refused again.
 #[tokio::test]
 async fn goaway_drops_in_flight_requests() {
     integration_tests::trace_init();

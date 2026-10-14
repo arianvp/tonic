@@ -36,6 +36,11 @@ impl Connection {
             .initial_stream_window_size(endpoint.init_stream_window_size)
             .initial_connection_window_size(endpoint.init_connection_window_size)
             .keep_alive_interval(endpoint.http2_keep_alive_interval)
+            // Like grpc-go, open no streams until the server's SETTINGS say
+            // how many it accepts. hyper otherwise assumes 100, and the server
+            // refuses the streams above its limit, e.g. when requests retried
+            // after a GOAWAY all go to a new connection at once.
+            .initial_max_send_streams(0)
             .timer(TokioTimer::new())
             .clone();
 

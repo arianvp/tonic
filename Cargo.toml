@@ -48,6 +48,6 @@ uninlined_format_args = "deny"
 broken_intra_doc_links = "deny"
 
 [patch.crates-io]
-# hyper 1.12.0 plus the GOAWAY error accessors used by GoawayRetry
-# (Error::h2_go_away_reason and Error::is_dispatch_gone).
-hyper = { git = "https://github.com/arianvp/hyper.git", rev = "ec3357cf71c0dfabab3a2097608e4af0a5e1308c" }
+# hyper 1.12.0 plus Error::is_protocol_nack(), used by GoawayRetry, and the
+# fix for requests dropped while waiting for their stream to open.
+hyper = { git = "https://github.com/arianvp/hyper.git", rev = "13ed56aef2f6a61eadf7011b5ebaeb12a076b368" }

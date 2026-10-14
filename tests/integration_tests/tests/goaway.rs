@@ -2,11 +2,17 @@ use bytes::{BufMut, Bytes, BytesMut};
 use h2::server;
 use http::HeaderMap;
 use integration_tests::pb::{
-    client_stream_client::ClientStreamClient, test_client::TestClient, Input,
+    client_stream_client::ClientStreamClient, test1_client::Test1Client, test_client::TestClient,
+    Input, Input1,
 };
+use std::io;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::TcpListener;
-use tonic::transport::Endpoint;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tonic::transport::{Channel, Endpoint};
+use tonic::Code;
 
 /// Minimal gRPC response handler for an empty Output message.
 /// Drains the full request body and reports the total received bytes in
@@ -299,4 +305,196 @@ async fn goaway_retries_client_streaming() {
         failures, 0,
         "All client-streaming requests should succeed via GOAWAY retry"
     );
+}
+
+/// Serves the first `refusing` connections by taking the request and then
+/// sending GOAWAY with last stream ID 0 and NO_ERROR, so the request was not
+/// processed. Later connections answer with `handle_grpc`. Returns how many
+/// requests reached the server.
+fn refusing_server(listener: TcpListener, refusing: usize) -> Arc<AtomicUsize> {
+    let requests = Arc::new(AtomicUsize::new(0));
+    tokio::spawn({
+        let requests = requests.clone();
+        async move {
+            for _ in 0..refusing {
+                let (tcp, _) = listener.accept().await.unwrap();
+                tokio::spawn(refuse_first_request(tcp, requests.clone()));
+            }
+            loop {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let requests = requests.clone();
+                tokio::spawn(async move {
+                    let mut conn = server::handshake(tcp).await.unwrap();
+                    while let Some(result) = conn.accept().await {
+                        let (req, respond) = result.unwrap();
+                        requests.fetch_add(1, Ordering::SeqCst);
+                        tokio::spawn(handle_grpc(req, respond));
+                    }
+                });
+            }
+        }
+    });
+    requests
+}
+
+/// Speaks just enough HTTP/2 to take the first request, all of its body or
+/// more than the client can replay, and send a GOAWAY that refuses it, which
+/// h2's server can't do for a stream it has received.
+async fn refuse_first_request(mut tcp: TcpStream, requests: Arc<AtomicUsize>) {
+    const DATA: u8 = 0x0;
+    const SETTINGS: u8 = 0x4;
+    const PING: u8 = 0x6;
+    const GOAWAY: u8 = 0x7;
+    const WINDOW_UPDATE: u8 = 0x8;
+    const ACK: u8 = 0x1;
+    const END_STREAM: u8 = 0x1;
+    const MAX_WINDOW: u32 = (1 << 31) - 1;
+
+    async fn write_frame(
+        tcp: &mut TcpStream,
+        kind: u8,
+        flags: u8,
+        payload: &[u8],
+    ) -> io::Result<()> {
+        let mut frame = (payload.len() as u32).to_be_bytes()[1..].to_vec();
+        frame.extend_from_slice(&[kind, flags, 0, 0, 0, 0]);
+        frame.extend_from_slice(payload);
+        tcp.write_all(&frame).await
+    }
+
+    let mut preface = [0; 24];
+    tcp.read_exact(&mut preface).await.unwrap();
+    // Let the client send its whole body without waiting for window updates.
+    let mut initial_window_size = vec![0x00, 0x04];
+    initial_window_size.extend_from_slice(&MAX_WINDOW.to_be_bytes());
+    write_frame(&mut tcp, SETTINGS, 0, &initial_window_size)
+        .await
+        .unwrap();
+    write_frame(
+        &mut tcp,
+        WINDOW_UPDATE,
+        0,
+        &(MAX_WINDOW - 65_535).to_be_bytes(),
+    )
+    .await
+    .unwrap();
+
+    let mut body_received = 0;
+    let mut refused = false;
+    let mut header = [0; 9];
+    // Read until the client closes the connection, closing it here first with
+    // unread data would reset it instead.
+    while tcp.read_exact(&mut header).await.is_ok() {
+        let len = u32::from_be_bytes([0, header[0], header[1], header[2]]) as usize;
+        let mut payload = vec![0; len];
+        if tcp.read_exact(&mut payload).await.is_err() {
+            break;
+        }
+        let written = match (header[3], header[4]) {
+            (SETTINGS, flags) if flags & ACK == 0 => {
+                write_frame(&mut tcp, SETTINGS, ACK, &[]).await
+            }
+            (PING, flags) if flags & ACK == 0 => write_frame(&mut tcp, PING, ACK, &payload).await,
+            (DATA, flags) if !refused => {
+                body_received += len;
+                if flags & END_STREAM != 0 || body_received > 512 * 1024 {
+                    refused = true;
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    // Last stream ID 0 and NO_ERROR.
+                    write_frame(&mut tcp, GOAWAY, 0, &[0; 8]).await
+                } else {
+                    Ok(())
+                }
+            }
+            _ => Ok(()),
+        };
+        if written.is_err() {
+            break;
+        }
+    }
+}
+
+fn connect(listener: &TcpListener) -> Channel {
+    let addr = listener.local_addr().unwrap();
+    Endpoint::from_shared(format!("http://{addr}"))
+        .unwrap()
+        .connect_lazy()
+}
+
+/// gRFC A6: a request the server refused is sent again once.
+#[tokio::test]
+async fn goaway_refused_request_is_retried_once() {
+    integration_tests::trace_init();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let channel = connect(&listener);
+    let requests = refusing_server(listener, 1);
+
+    let mut client = TestClient::new(channel);
+    client.unary_call(Input {}).await.unwrap();
+    assert_eq!(requests.load(Ordering::SeqCst), 2);
+}
+
+/// gRFC A6: only the first attempt is retried, a refused retry fails with
+/// UNAVAILABLE.
+#[tokio::test]
+async fn goaway_refused_retry_is_unavailable() {
+    integration_tests::trace_init();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let channel = connect(&listener);
+    let requests = refusing_server(listener, 2);
+
+    let mut client = TestClient::new(channel);
+    let status = client.unary_call(Input {}).await.unwrap_err();
+    assert_eq!(status.code(), Code::Unavailable, "{status:?}");
+    assert_eq!(requests.load(Ordering::SeqCst), 2);
+}
+
+/// gRFC A6: a request that sent more body than the client buffers to replay
+/// it is committed and not retried.
+#[tokio::test]
+async fn goaway_refused_large_request_is_unavailable() {
+    integration_tests::trace_init();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let channel = connect(&listener);
+    let requests = refusing_server(listener, 1);
+
+    let mut client = Test1Client::new(channel);
+    let input = Input1 {
+        buf: vec![1; 1024 * 1024],
+    };
+    let status = client.unary_call(input).await.unwrap_err();
+    assert_eq!(status.code(), Code::Unavailable, "{status:?}");
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+}
+
+/// gRFC A6: a stream reset with REFUSED_STREAM is sent again once.
+#[tokio::test]
+async fn refused_stream_is_retried_once() {
+    integration_tests::trace_init();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let channel = connect(&listener);
+    let requests = Arc::new(AtomicUsize::new(0));
+    tokio::spawn({
+        let requests = requests.clone();
+        async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut conn = server::handshake(tcp).await.unwrap();
+            while let Some(result) = conn.accept().await {
+                let (req, mut respond) = result.unwrap();
+                if requests.fetch_add(1, Ordering::SeqCst) == 0 {
+                    respond.send_reset(h2::Reason::REFUSED_STREAM);
+                } else {
+                    tokio::spawn(handle_grpc(req, respond));
+                }
+            }
+        }
+    });
+
+    let mut client = TestClient::new(channel);
+    client.unary_call(Input {}).await.unwrap();
+    assert_eq!(requests.load(Ordering::SeqCst), 2);
 }

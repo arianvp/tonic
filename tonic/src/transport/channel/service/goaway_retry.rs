@@ -19,65 +19,61 @@ use tower_service::Service;
 
 type BoxFuture = Pin<Box<dyn future::Future<Output = Result<Response<Body>, BoxError>> + Send>>;
 
-/// Returns true if the error indicates a request that was never processed by
-/// the server and is unconditionally safe to retry per RFC 9113 §6.8 and gRFC A6.
-///
-/// This covers four cases:
-/// - GOAWAY with NO_ERROR: the server is shutting down gracefully, streams that
-///   tried to open after conn_error was set get this error
-/// - REFUSED_STREAM: streams that had HEADERS on the wire but whose IDs were
-///   above last_stream_id get RST_STREAM with REFUSED_STREAM
-/// - Canceled: requests queued in hyper's dispatch channel that never reached
-///   h2::SendRequest::send_request() — the channel was dropped when the
-///   connection task exited on Dispatched::Shutdown
-/// - DispatchGone: the h2 connection task exited (e.g. after draining a GOAWAY)
-///   while requests were still queued in hyper's dispatch channel — the
-///   Callback::drop() impl sends this error to waiting callers
-fn is_retryable_stream_rejection(err: &BoxError) -> bool {
-    // Walk the full source chain — the hyper::Error may be wrapped in
-    // tonic::transport::Error or other layers.
-    let mut current: Option<&(dyn StdError + 'static)> = Some(err.as_ref());
-    while let Some(e) = current {
-        if let Some(hyper_err) = e.downcast_ref::<hyper::Error>() {
-            // GOAWAY with NO_ERROR
-            if hyper_err.h2_go_away_reason() == Some(0) {
-                return true;
-            }
+/// How much of a request body is kept to send the request again, like
+/// grpc-go's default `MaxRetryRPCBufferSize`. A request that sends more is
+/// committed to its current attempt.
+const MAX_REPLAY_BUFFER_SIZE: usize = 256 * 1024;
 
-            // Canceled: request never left hyper's dispatch channel
-            if hyper_err.is_canceled() {
-                return true;
-            }
+/// How many times a request that never left the client is sent again. gRFC A6
+/// retries those until the RPC's deadline, which a tonic request doesn't
+/// necessarily have.
+const MAX_NOT_SENT_RETRIES: usize = 16;
 
-            // DispatchGone: connection task exited while requests were queued.
-            if hyper_err.is_dispatch_gone() {
-                return true;
-            }
-        }
-
-        if let Some(h2_err) = e.downcast_ref::<h2::Error>()
-            && h2_err.is_remote()
-            && h2_err.reason() == Some(h2::Reason::REFUSED_STREAM)
-        {
-            return true;
-        }
-
-        current = e.source();
-    }
-
-    false
+/// Why a request failed without being processed, the failures gRFC A6 retries
+/// transparently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unprocessed {
+    /// The request never left the client: the connection went away before
+    /// hyper sent it.
+    NotSent,
+    /// The server refused the request without processing it: a GOAWAY's last
+    /// stream ID is below the request's stream, or the stream was reset with
+    /// REFUSED_STREAM.
+    Refused,
 }
 
-/// Service layer that transparently retries requests rejected before processing.
+fn unprocessed(err: &BoxError) -> Option<Unprocessed> {
+    // The hyper::Error may be wrapped, e.g. in a ConnectError.
+    let mut source: Option<&(dyn StdError + 'static)> = Some(err.as_ref());
+    while let Some(err) = source {
+        if let Some(err) = err.downcast_ref::<hyper::Error>() {
+            if err.is_canceled() {
+                return Some(Unprocessed::NotSent);
+            }
+            if err.is_protocol_nack() {
+                return Some(Unprocessed::Refused);
+            }
+        }
+        source = err.source();
+    }
+    None
+}
+
+/// Service layer that transparently retries requests the server never
+/// processed, like grpc-go does (gRFC A6, "Transparent Retries"):
 ///
-/// When an HTTP/2 server sends GOAWAY with NO_ERROR or resets a stream with
-/// REFUSED_STREAM, the request was never processed by the server. Per gRFC A6,
-/// these are unconditionally safe to retry. This layer detects such failures
-/// and retries on a fresh connection.
+/// - A request that never left the client is sent again.
+/// - A request the server refused is sent again once, if it was the first
+///   attempt. Any retry ends the first attempt.
+/// - A request is committed to its attempt once it sent more than
+///   [`MAX_REPLAY_BUFFER_SIZE`] of body, or got its response headers, and is
+///   not sent again after that.
 ///
-/// Request bodies are made cloneable via [`SharedBody`] so they can be replayed.
-/// The clone is dropped as soon as the first attempt succeeds (Response-Headers
-/// received = RPC committed per gRFC A6), freeing the buffer.
+/// A refused request that is not retried fails with `UNAVAILABLE`, see
+/// `Status::from_hyper_error`.
+///
+/// Request bodies are buffered behind [`BodyShared`] so they can be replayed.
+/// The buffer is released once the request is committed.
 pub(crate) struct GoawayRetry<S> {
     inner: S,
 }
@@ -119,7 +115,8 @@ where
         let body_shared = Arc::new(Mutex::new(Some(BodyShared::new(body))));
 
         Box::pin(async move {
-            let mut attempts = 0;
+            let mut first_attempt = true;
+            let mut not_sent_retries = 0;
             let mut shared = body_shared.clone().lock_owned().await;
 
             loop {
@@ -131,61 +128,33 @@ where
                     })),
                 );
 
-                tracing::trace!(attempt = attempts, "goaway_retry: calling inner service");
                 let ret = svc.call(req).await;
 
-                if let Err(ref e) = ret {
-                    let retryable = is_retryable_stream_rejection(e);
-                    tracing::debug!(
-                        attempt = attempts,
-                        retryable,
-                        error = %e,
-                        error_debug = ?e,
-                        "goaway_retry: call failed"
-                    );
+                let Err(err) = &ret else {
+                    return ret;
+                };
+                let retry = match unprocessed(err) {
+                    Some(Unprocessed::NotSent) => not_sent_retries < MAX_NOT_SENT_RETRIES,
+                    Some(Unprocessed::Refused) => first_attempt,
+                    None => false,
+                };
+                tracing::debug!(error = %err, first_attempt, retry, "goaway_retry: call failed");
+                if !retry {
+                    return ret;
                 }
 
-                // If the request was rejected before processing (GOAWAY or
-                // REFUSED_STREAM), retry on a fresh connection. We may need
-                // multiple attempts because the underlying Reconnect layer
-                // might still dispatch to the dying connection on the first
-                // retry (the h2 connection stays alive to drain accepted
-                // streams, so hyper's is_closed() returns false briefly).
-                if ret.as_ref().is_err_and(is_retryable_stream_rejection) && attempts < 16 {
-                    shared = body_shared.clone().lock_owned().await;
-                    if shared.is_some() {
-                        attempts += 1;
-                        tracing::debug!(
-                            attempt = attempts,
-                            "goaway_retry: retrying, waiting for poll_ready"
-                        );
-                        match future::poll_fn(|cx| svc.poll_ready(cx)).await {
-                            Ok(()) => {
-                                tracing::debug!(
-                                    attempt = attempts,
-                                    "goaway_retry: poll_ready succeeded, retrying"
-                                );
-                            }
-                            Err(e) => {
-                                tracing::debug!(
-                                    attempt = attempts,
-                                    error = %e,
-                                    error_debug = ?e,
-                                    "goaway_retry: poll_ready failed on retry"
-                                );
-                                return Err(e);
-                            }
-                        }
-                        continue;
-                    } else {
-                        tracing::debug!(
-                            attempt = attempts,
-                            "goaway_retry: body already committed, cannot retry"
-                        );
-                    }
+                // The body is gone once the request is committed.
+                shared = body_shared.clone().lock_owned().await;
+                if shared.is_none() {
+                    tracing::debug!("goaway_retry: request committed, not retrying");
+                    return ret;
                 }
 
-                return ret;
+                if unprocessed(err) == Some(Unprocessed::NotSent) {
+                    not_sent_retries += 1;
+                }
+                first_attempt = false;
+                future::poll_fn(|cx| svc.poll_ready(cx)).await?;
             }
         })
     }
@@ -310,7 +279,7 @@ impl http_body::Body for BodyRef {
 
         if let Some(data) = frame.data_ref() {
             if let Some(new_len) = data.remaining().checked_add(shared.byte_count)
-                && new_len < (1 << 18)
+                && new_len <= MAX_REPLAY_BUFFER_SIZE
             {
                 shared.byte_count = new_len;
                 shared.frames.push(data.clone());

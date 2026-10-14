@@ -439,6 +439,18 @@ impl Status {
             return Some(Status::unavailable(err.to_string()));
         }
 
+        // Per https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md#goaway-frame
+        // > Clients should consider any stream initiated after the last successfully accepted
+        // > stream as UNAVAILABLE and retry the call elsewhere.
+        // A stream reset with REFUSED_STREAM is UNAVAILABLE too.
+        if err.is_protocol_nack() {
+            let message = match err.source() {
+                Some(source) => format!("the server refused the request: {err}: {source}"),
+                None => format!("the server refused the request: {err}"),
+            };
+            return Some(Status::unavailable(message));
+        }
+
         if err.is_canceled() {
             return Some(Status::cancelled(err.to_string()));
         }
